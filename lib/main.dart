@@ -29,7 +29,7 @@ class LogManager {
     final now = DateTime.now().toIso8601String().substring(11, 19);
     final entry = "[$now][$tag] $message";
     logs.add(entry);
-    if (logs.length > 500) logs.removeAt(0); // 维持500条最新日志
+    if (logs.length > 500) logs.removeAt(0);
     _controller.add(List.from(logs));
   }
 
@@ -133,7 +133,6 @@ class TtsService {
   ) async {
     final uri = Uri.parse(engine.endpoint.isNotEmpty ? engine.endpoint : "https://api.xiaomimimo.com/v1/chat/completions");
     
-    // 语速控制提示词
     final messages = [
       if ((speed - 1.0).abs() >= 0.05)
         {"role": "user", "content": "请以约 ${speed.toStringAsFixed(2)} 倍的较快语速朗读，吐字清晰流利。"},
@@ -200,31 +199,26 @@ class ReaderHomePage extends StatefulWidget {
 }
 
 class _ReaderHomePageState extends State<ReaderHomePage> {
-  // 编辑区控制器
   final TextEditingController _textController = TextEditingController();
   final ScrollController _logScrollController = ScrollController();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  // 预设引擎
   late List<TtsEngine> _engines;
   late TtsEngine _currentEngine;
   late TtsVoice _currentVoice;
 
-  // 播放参数
   double _speed = 1.75;
-  int _bitrate = 64; // kbps
-  int _preloadCount = 4; // 预读数量
-  int _concurrency = 2; // 并发线程
-  int _sentenceGapMs = 250; // 句子间隔毫秒
+  int _bitrate = 64;
+  int _preloadCount = 4;
+  int _concurrency = 2;
+  int _sentenceGapMs = 250;
 
-  // 播放状态与内存缓存
   List<String> _sentences = [];
   int _currentSentenceIndex = -1;
   bool _isPlaying = false;
   bool _isPaused = false;
   int _playSessionId = 0;
 
-  // 关键：纯 RAM 音频缓存池，完全不落盘
   final Map<int, Uint8List> _ramAudioCache = {};
   final Set<int> _inFlightFetches = {};
 
@@ -242,7 +236,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         name: "Fish.Audio (官方/中转)",
         type: "fish_audio",
         endpoint: "https://api.fish.audio/v1/tts",
-        apiKey: "", // 用户界面可输入
+        apiKey: "",
         voices: [
           TtsVoice(id: "a688f2129bea41d1ae6042462892ecf8", name: "推荐主力男声"),
           TtsVoice(id: "cf71d823861b4e0eadff1672d646da36", name: "几何女声(知性自然)"),
@@ -296,14 +290,12 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     super.dispose();
   }
 
-  // ──────────────── 文本切分与分句 ────────────────
   void _splitSentences() {
     final text = _textController.text;
     if (text.trim().isEmpty) {
       _sentences = [];
       return;
     }
-    // 依据标点与换行切分为自然短句
     final regex = RegExp(r'[^。！？；\n\r]*[。！？；…]+|[^。！？；\n\r]+');
     final matches = regex.allMatches(text);
     _sentences = matches
@@ -313,7 +305,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     LogManager.instance.log("TEXT", "文本已分句，共计 ${_sentences.length} 句");
   }
 
-  // ──────────────── 并发调度与预读加载管线 ────────────────
   void _schedulePreload(int currentIndex, int sessionId) {
     if (sessionId != _playSessionId) return;
 
@@ -322,7 +313,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       if (_ramAudioCache.containsKey(i) || _inFlightFetches.contains(i)) continue;
 
       if (_inFlightFetches.length >= _concurrency) {
-        break; // 遵守用户设定的并发线程上限
+        break;
       }
 
       _fetchToRam(i, sessionId);
@@ -343,7 +334,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       );
 
       if (sessionId == _playSessionId) {
-        _ramAudioCache[index] = audioData; // 存入纯 RAM 字典
+        _ramAudioCache[index] = audioData;
         LogManager.instance.log("PIPELINE", "第 ${index + 1} 句预读就绪，当前 RAM 缓存条数: ${_ramAudioCache.length}");
       }
     } catch (e) {
@@ -356,13 +347,11 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     }
   }
 
-  // ──────────────── 纯 RAM 音频播放 ────────────────
   Future<void> _playCurrentSentence() async {
     final idx = _currentSentenceIndex;
     final sessionId = _playSessionId;
     _schedulePreload(idx, sessionId);
 
-    // 等待当前句进入 RAM
     int waitCounter = 0;
     while (!_ramAudioCache.containsKey(idx)) {
       if (!_isPlaying || sessionId != _playSessionId) return;
@@ -371,7 +360,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       }
       await Future.delayed(const Duration(milliseconds: 60));
       waitCounter++;
-      if (waitCounter > 300) { // 18秒超时
+      if (waitCounter > 300) {
         LogManager.instance.log("TIMEOUT", "第 ${idx + 1} 句加载超时");
         _stopPlayback("第 ${idx + 1} 句音频加载超时，已停止。");
         return;
@@ -382,8 +371,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
     final Uint8List audioBytes = _ramAudioCache[idx]!;
     LogManager.instance.log("AUDIO", "▶️ 正在通过 RAM 播放第 ${idx + 1}/${_sentences.length} 句: ${_sentences[idx]}");
-
-    // 关键机制：使用 BytesSource 直接从 RAM 播放，绝不写硬盘临时文件
     await _audioPlayer.play(BytesSource(audioBytes));
   }
 
@@ -440,7 +427,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     LogManager.instance.log("CONTROL", reason ?? "朗读已停止，RAM 缓存已释放");
   }
 
-  // ──────────────── 批量合成并导出至本地硬盘 ────────────────
   Future<void> _exportAudio() async {
     if (_textController.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("没有可导出的正文！")));
@@ -488,7 +474,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     }
   }
 
-  // ──────────────── 对话框：编辑引擎与发音人 ────────────────
   void _showEngineConfigDialog() {
     final apiKeyController = TextEditingController(text: _currentEngine.apiKey);
     final endpointController = TextEditingController(text: _currentEngine.endpoint);
@@ -612,7 +597,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // ──────────────── 界面布局 ────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -635,7 +619,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       ),
       body: Row(
         children: [
-          // ── 左侧主体：控制工具栏 + 文本拖拽展示区 ──
           Expanded(
             flex: 6,
             child: Column(
@@ -645,8 +628,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               ],
             ),
           ),
-
-          // ── 右侧侧边栏：播放性能控制 + 实时内存日志窗 ──
           Container(
             width: 320,
             decoration: BoxDecoration(
@@ -666,7 +647,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 顶栏控制栏
   Widget _buildTopControlBar() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, pady: 8),
@@ -676,7 +656,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         runSpacing: 8,
         crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          // 引擎切换
           DropdownButton<TtsEngine>(
             value: _currentEngine,
             items: _engines
@@ -691,8 +670,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               }
             },
           ),
-
-          // 发音人切换
           DropdownButton<TtsVoice>(
             value: _currentEngine.voices.contains(_currentVoice) ? _currentVoice : _currentEngine.voices.first,
             items: _currentEngine.voices
@@ -702,8 +679,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               if (v != null) setState(() => _currentVoice = v);
             },
           ),
-
-          // 语速调节
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -722,8 +697,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               Text("${_speed.toStringAsFixed(2)}x"),
             ],
           ),
-
-          // 码率模式
           DropdownButton<int>(
             value: _bitrate,
             items: const [
@@ -732,8 +705,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             ],
             onChanged: (b) => setState(() => _bitrate = b ?? 64),
           ),
-
-          // 核心控制按钮
           ElevatedButton.icon(
             style: ElevatedButton.styleFrom(backgroundColor: _isPlaying ? Colors.grey : Colors.green, foregroundColor: Colors.white),
             icon: const Icon(Icons.play_arrow),
@@ -757,7 +728,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 文本区（支持复制、粘贴、文件拖拽）
   Widget _buildDragAndDropTextArea() {
     return Expanded(
       child: DropTarget(
@@ -808,7 +778,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 右侧参数微调
   Widget _buildSidebarSettings() {
     return Padding(
       padding: const EdgeInsets.all(12),
@@ -846,11 +815,10 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 右侧下半部：实时调试日志窗口
   Widget _buildLiveLogConsole() {
     return Expanded(
       child: Container(
-        color: const TextStyle(color: Colors.black).color == Colors.white ? Colors.black : const Color(0xFF1E1E1E),
+        color: const Color(0xFF1E1E1E),
         child: Column(
           children: [
             Container(
