@@ -1,0 +1,31 @@
+name: Build Windows App
+
+on:
+  push:
+  workflow_dispatch: # 支持你在网页端随时点按钮手动打包
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Flutter 官方环境
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: 云端自动补齐 Windows 底层并编译
+        run: |
+          flutter create --platforms=windows .
+          flutter pub get
+          flutter build windows --release
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "tts_reader_windows.zip"
+
+      - name: 生成可下载的 exe 压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-reader-win10
+          path: tts_reader_windows.zip
