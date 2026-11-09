@@ -1,4 +1,4 @@
-name: Build Windows Portable
+name: Build Windows Portable App
 
 on:
   push:
@@ -9,36 +9,39 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出云端仓库
         uses: actions/checkout@v4
 
-      - name: 准备 Flutter 稳定版环境
+      - name: 配置 Flutter 官方环境
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      - name: 保护代码并生成免安装绿色版
+      - name: 自适应校准工程并生成 Windows 底层
         shell: pwsh
         run: |
-          # 1. 先把你的真实业务代码与依赖文件备份到临时位置
-          Copy-Item "lib/main.dart" "main_backup.dart"
-          Copy-Item "pubspec.yaml" "pubspec_backup.yaml"
+          # 1. 自动容错：如果在网页端直接建在根目录的 main.dart，自动移入 lib/ 目录
+          if (-not (Test-Path "lib")) {
+              New-Item -ItemType Directory -Force -Path "lib"
+          }
+          if (Test-Path "main.dart") {
+              Move-Item -Force "main.dart" "lib/main.dart"
+              Write-Host "已自动将根目录的 main.dart 校准至 lib/main.dart"
+          }
 
-          # 2. 生成 Windows 原生底层工程（即使它生成了默认Demo也没关系）
-          flutter create --platforms=windows .
+          # 2. 在临时目录生成 Windows 原生工程，仅提取 windows 文件夹，绝不触碰你的代码
+          flutter create --platforms=windows temp_gen
+          Copy-Item -Recurse -Force "temp_gen/windows" "windows"
+          Remove-Item -Recurse -Force "temp_gen"
 
-          # 3. 强制把你的真实代码还原回去，绝不被默认计数器冲掉！
-          Move-Item -Force "main_backup.dart" "lib/main.dart"
-          Move-Item -Force "pubspec_backup.yaml" "pubspec.yaml"
-
-          # 4. 获取依赖与编译 Windows 原生可执行程序
+          # 3. 安装依赖并编译 Windows 绿色便携版
           flutter pub get
           flutter build windows --release
 
-          # 5. 打包为免安装绿色便携 zip 压缩包
+          # 4. 打包为绿色免安装 zip 压缩包
           Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "tts_reader_portable.zip"
 
-      - name: 上传免安装绿色包
+      - name: 上传便携免安装包
         uses: actions/upload-artifact@v4
         with:
           name: tts_reader_portable_win10
