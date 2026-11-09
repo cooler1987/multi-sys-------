@@ -8,13 +8,102 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 
+// ─────────────────────────────────────────────────────────────
+// 1. 全动态代理管理器 (自动探测 Windows 系统代理 / 自定义 / 纯直连)
+// ─────────────────────────────────────────────────────────────
+class AppProxyManager {
+  static final AppProxyManager instance = AppProxyManager._();
+  AppProxyManager._();
+
+  String mode = "auto"; // "auto" 自动检测 | "custom" 自定义 | "direct" 纯直连
+  String customHost = "127.0.0.1";
+  int customPort = 7890;
+
+  String? _lastDetectedProxy;
+  DateTime? _lastDetectTime;
+
+  String getProxyString(Uri uri) {
+    if (mode == "direct") {
+      return "DIRECT";
+    } else if (mode == "custom") {
+      return "PROXY $customHost:$customPort; DIRECT";
+    } else {
+      final detected = detectSystemProxy();
+      return detected != null ? "PROXY $detected; DIRECT" : "DIRECT";
+    }
+  }
+
+  String? detectSystemProxy({bool forceRefresh = false}) {
+    if (!forceRefresh && _lastDetectedProxy != null && _lastDetectTime != null) {
+      if (DateTime.now().difference(_lastDetectTime!) < const Duration(seconds: 3)) {
+        return _lastDetectedProxy;
+      }
+    }
+
+    final env = Platform.environment;
+    final envProxy = env['HTTPS_PROXY'] ?? env['https_proxy'] ?? env['HTTP_PROXY'] ?? env['http_proxy'] ?? env['ALL_PROXY'];
+    if (envProxy != null && envProxy.isNotEmpty) {
+      final clean = envProxy.replaceAll(RegExp(r'^https?://'), '');
+      _lastDetectedProxy = clean;
+      _lastDetectTime = DateTime.now();
+      return clean;
+    }
+
+    if (Platform.isWindows) {
+      try {
+        final queryEnabled = Process.runSync('reg', [
+          'query',
+          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+          '/v',
+          'ProxyEnable',
+        ]);
+        if (queryEnabled.stdout.toString().contains('0x1')) {
+          final queryServer = Process.runSync('reg', [
+            'query',
+            r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+            '/v',
+            'ProxyServer',
+          ]);
+          final out = queryServer.stdout.toString();
+          final match = RegExp(r'ProxyServer\s+REG_SZ\s+(.+)').firstMatch(out);
+          if (match != null) {
+            String server = match.group(1)!.trim();
+            if (server.contains('https=')) {
+              server = RegExp(r'https=([^;]+)').firstMatch(server)?.group(1) ?? server;
+            } else if (server.contains('=')) {
+              server = server.split('=').last;
+            }
+            _lastDetectedProxy = server;
+            _lastDetectTime = DateTime.now();
+            return server;
+          }
+        }
+      } catch (_) {}
+    }
+
+    _lastDetectedProxy = null;
+    return null;
+  }
+}
+
+class DynamicHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..findProxy = (uri) {
+        return AppProxyManager.instance.getProxyString(uri);
+      };
+  }
+}
+
 void main() {
+  HttpOverrides.global = DynamicHttpOverrides();
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const TtsReaderApp());
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. 日志管理系统 (支持实时显示与文件导出)
+// 2. 日志管理系统
 // ─────────────────────────────────────────────────────────────
 class LogManager {
   static final LogManager instance = LogManager._();
@@ -22,7 +111,6 @@ class LogManager {
 
   final List<String> logs = [];
   final StreamController<List<String>> _controller = StreamController<List<String>>.broadcast();
-
   Stream<List<String>> get stream => _controller.stream;
 
   void log(String tag, String message) {
@@ -41,14 +129,13 @@ class LogManager {
   Future<String?> exportLogsToFile() async {
     if (logs.isEmpty) return null;
     final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '保存日志文件',
+      dialogTitle: '保存调试日志',
       fileName: 'tts_log_${DateTime.now().millisecondsSinceEpoch}.txt',
       type: FileType.custom,
       allowedExtensions: ['txt', 'log'],
     );
     if (savePath != null) {
-      final file = File(savePath);
-      await file.writeAsString(logs.join('\r\n'));
+      await File(savePath).writeAsString(logs.join('\r\n'));
       return savePath;
     }
     return null;
@@ -56,7 +143,7 @@ class LogManager {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. 通用自定义 TTS 引擎数据结构 (支持 JSON 序列化持久化)
+// 3. 通用自定义 TTS 引擎数据结构
 // ─────────────────────────────────────────────────────────────
 enum AudioResponseType { binaryStream, jsonBase64, jsonUrl }
 
@@ -72,8 +159,8 @@ class TtsVoice {
 class CustomTtsEngine {
   String id;
   String name;
-  String method; // 'GET' 或 'POST'
-  String urlTemplate; // 支持 {{text}}, {{voice}}, {{speed}}, {{bitrate}}
+  String method;
+  String urlTemplate;
   Map<String, String> headers;
   String bodyTemplate;
   AudioResponseType responseType;
@@ -118,7 +205,7 @@ class CustomTtsEngine {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. 通用 TTS 执行器 (内存流控)
+// 4. 通用 TTS 执行器 (内存流控)
 // ─────────────────────────────────────────────────────────────
 class UniversalTtsExecutor {
   static Future<Uint8List> synthesize({
@@ -128,14 +215,14 @@ class UniversalTtsExecutor {
     required double speed,
     required int bitrate,
   }) async {
-    LogManager.instance.log("EXEC", "调用引擎 [${engine.name}]，发音人: $voiceId，字数: ${text.length}");
+    LogManager.instance.log("EXEC", "调用引擎 [${engine.name}]，发音人: $voiceId，目标倍速: ${speed.toStringAsFixed(2)}x");
 
     String replaceVars(String input, {bool isUrl = false}) {
       final safeText = isUrl ? Uri.encodeComponent(text) : jsonEncode(text).replaceFirst(RegExp(r'^"'), '').replaceFirst(RegExp(r'"$'), '');
       return input
           .replaceAll('{{text}}', safeText)
           .replaceAll('{{voice}}', voiceId)
-          .replaceAll('{{speed}}', speed.toStringAsFixed(2))
+          .replaceAll('{{speed}}', speed.toStringAsFixed(2)) // 真实动态替换语速
           .replaceAll('{{bitrate}}', bitrate.toString());
     }
 
@@ -151,7 +238,7 @@ class UniversalTtsExecutor {
         res = await http.get(targetUrl, headers: processedHeaders).timeout(const Duration(seconds: 35));
       }
     } catch (e) {
-      throw Exception("网络连接超时或断开: $e");
+      throw Exception("网络连接超时或断开 ($e)。\n提示：若访问海外直连，请检查顶部【🌐 代理设置】！");
     }
 
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -161,7 +248,7 @@ class UniversalTtsExecutor {
 
     switch (engine.responseType) {
       case AudioResponseType.binaryStream:
-        if (res.bodyBytes.isEmpty) throw Exception("接口返回空的音频数据流");
+        if (res.bodyBytes.isEmpty) throw Exception("接口返回空数据");
         LogManager.instance.log("RAM", "二进制流已进入内存 (${(res.bodyBytes.lengthInBytes / 1024).toStringAsFixed(1)} KB)");
         return res.bodyBytes;
 
@@ -203,7 +290,7 @@ class UniversalTtsExecutor {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. 主程序界面与状态持久化
+// 5. 主程序与 UI 交互
 // ─────────────────────────────────────────────────────────────
 class TtsReaderApp extends StatelessWidget {
   const TtsReaderApp({super.key});
@@ -211,7 +298,7 @@ class TtsReaderApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '万能 TTS 朗读与发音人评测工具 (Windows 10)',
+      title: '万能 TTS 朗读与发音人评测工具 (真正物理倍速版)',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
@@ -255,12 +342,10 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   @override
   void initState() {
     super.initState();
-    _audioPlayer.setVolume(1.0);
     _loadConfig();
     _initAudioPlayer();
   }
 
-  // ──────────────── 配置持久化管理 (本地自动备份与恢复) ────────────────
   File get _localConfigFile => File('tts_config.json');
 
   void _loadConfig() {
@@ -273,17 +358,22 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         _preloadCount = data['preloadCount'] ?? 4;
         _concurrency = data['concurrency'] ?? 2;
         _sentenceGapMs = data['sentenceGapMs'] ?? 250;
+
+        AppProxyManager.instance.mode = data['proxyMode'] ?? "auto";
+        AppProxyManager.instance.customHost = data['proxyHost'] ?? "127.0.0.1";
+        AppProxyManager.instance.customPort = data['proxyPort'] ?? 7890;
+
         final list = (data['engines'] as List<dynamic>?)?.map((e) => CustomTtsEngine.fromJson(e)).toList();
         if (list != null && list.isNotEmpty) {
           _engines = list;
           _currentEngine = _engines.first;
           _currentVoice = _currentEngine.voices.isNotEmpty ? _currentEngine.voices.first : TtsVoice(id: '', name: '默认');
-          LogManager.instance.log("CONFIG", "已自动加载本地保存的持久化设置: tts_config.json");
+          LogManager.instance.log("CONFIG", "已自动加载本地持久化设置 tts_config.json");
           return;
         }
       }
     } catch (e) {
-      LogManager.instance.log("CONFIG-ERR", "加载本地配置失败: $e，使用内置预设");
+      LogManager.instance.log("CONFIG-ERR", "加载本地配置失败: $e，启用内置预设");
     }
     _initDefaultEngines();
   }
@@ -296,63 +386,26 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         'preloadCount': _preloadCount,
         'concurrency': _concurrency,
         'sentenceGapMs': _sentenceGapMs,
+        'proxyMode': AppProxyManager.instance.mode,
+        'proxyHost': AppProxyManager.instance.customHost,
+        'proxyPort': AppProxyManager.instance.customPort,
         'engines': _engines.map((e) => e.toJson()).toList(),
       };
       _localConfigFile.writeAsStringSync(const JsonEncoder.withIndent("  ").convert(data));
-      LogManager.instance.log("CONFIG", "配置已成功保存至本地 tts_config.json");
+      LogManager.instance.log("CONFIG", "配置已保存至本地 tts_config.json");
     } catch (e) {
       LogManager.instance.log("CONFIG-ERR", "自动保存失败: $e");
     }
   }
 
-  Future<void> _exportBackupDialog() async {
-    final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '导出全部配置与发音人备份',
-      fileName: 'tts_full_backup_${DateTime.now().millisecondsSinceEpoch}.json',
-      type: FileType.custom,
-      allowedExtensions: ['json'],
-    );
-    if (savePath != null) {
-      final data = {
-        'speed': _speed,
-        'bitrate': _bitrate,
-        'engines': _engines.map((e) => e.toJson()).toList(),
-      };
-      await File(savePath).writeAsString(const JsonEncoder.withIndent("  ").convert(data));
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("配置备份已导出至: $savePath")));
-    }
-  }
-
-  Future<void> _importBackupDialog() async {
-    final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['json']);
-    if (res != null && res.files.single.path != null) {
-      try {
-        final content = await File(res.files.single.path!).readAsString();
-        final data = jsonDecode(content);
-        final list = (data['engines'] as List<dynamic>?)?.map((e) => CustomTtsEngine.fromJson(e)).toList();
-        if (list != null && list.isNotEmpty) {
-          setState(() {
-            _engines = list;
-            _currentEngine = _engines.first;
-            _currentVoice = _currentEngine.voices.first;
-          });
-          _saveConfig();
-          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("🎉 备份恢复成功！")));
-        }
-      } catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("导入失败: $e")));
-      }
-    }
-  }
-
-  // 内置预设模板 (修复并包含正确的免密与头配置)
   void _initDefaultEngines() {
     _engines = [
       CustomTtsEngine(
         id: "cf_worker_template",
-        name: "Cloudflare 中转免密引擎 (推荐)",
+        name: "Cloudflare 中转引擎 (国内直连)",
         method: "GET",
-        urlTemplate: "https://tts.yzwww.ggff.net/tts?text={{text}}&voice={{voice}}&speed={{speed}}&bitrate={{bitrate}}",
+        // 关键修复：URL 动态透传 speed
+        urlTemplate: "https://tts.yzwww.ggff.net/tts?token=你的访问密码&text={{text}}&voice={{voice}}&speed={{speed}}&bitrate={{bitrate}}",
         headers: {},
         bodyTemplate: "",
         responseType: AudioResponseType.binaryStream,
@@ -370,8 +423,9 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         headers: {
           "Authorization": "Bearer 填入你的FishAudio密钥",
           "Content-Type": "application/json",
-          "model": "s2.1-pro-free" // 关键：已默认配好免费模型头
+          "model": "s2.1-pro-free"
         },
+        // 关键修复：将硬编码的 1.75 彻底替换为动态占位符 {{speed}}
         bodyTemplate: jsonEncode({
           "text": "{{text}}",
           "reference_id": "{{voice}}",
@@ -379,8 +433,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           "mp3_bitrate": 64,
           "chunk_length": 100,
           "latency": "balanced",
-          "prosody": {"speed": 1.75}
-        }),
+          "prosody": {"speed": "{{speed}}"}
+        }).replaceAll('"{{speed}}"', '{{speed}}'), // 输出为数字而非字符串
         responseType: AudioResponseType.binaryStream,
         jsonExtractPath: "",
         voices: [
@@ -418,26 +472,123 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     _currentVoice = _currentEngine.voices.first;
   }
 
-  // ──────────────── 音频播放核心 (双层 RAM 解码保底，解决 Windows 无声) ────────────────
+  // ──────────────── 全局网络代理配置弹窗 ────────────────
+  void _openProxySettingsDialog() {
+    final hostCtrl = TextEditingController(text: AppProxyManager.instance.customHost);
+    final portCtrl = TextEditingController(text: AppProxyManager.instance.customPort.toString());
+    String currentMode = AppProxyManager.instance.mode;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          final detected = AppProxyManager.instance.detectSystemProxy(forceRefresh: true);
+
+          return AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.lan, color: Colors.deepPurple),
+                SizedBox(width: 8),
+                Text("全局网络与代理配置", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            content: SizedBox(
+              width: 500,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("选择软件请求海外 API 时采用的网络路由模式：", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 12),
+                  RadioListTile<String>(
+                    value: "auto",
+                    groupValue: currentMode,
+                    title: const Text("🟢 自动检测系统代理 (自适应任意软件端口)", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text(
+                      detected != null ? "已自动嗅探到当前 Windows 生效代理：$detected" : "未检测到系统代理（若开启了代理软件，请确认开启【系统代理】开关）",
+                      style: TextStyle(color: detected != null ? Colors.green.shade700 : Colors.orange.shade800, fontSize: 11),
+                    ),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                  RadioListTile<String>(
+                    value: "custom",
+                    groupValue: currentMode,
+                    title: const Text("🟡 自定义代理端口 (完全自主掌控)", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: const Text("自由输入 IP 与端口 (支持 Clash 7890、v2rayN 10809、SS 1080 等)", style: TextStyle(fontSize: 11)),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                  if (currentMode == "custom")
+                    Padding(
+                      padding: const EdgeInsets.only(left: 28, right: 16, top: 6, bottom: 6),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            flex: 3,
+                            child: TextField(controller: hostCtrl, decoration: const InputDecoration(labelText: "代理 IP", isDense: true, border: OutlineInputBorder())),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            flex: 2,
+                            child: TextField(controller: portCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "端口", isDense: true, border: OutlineInputBorder())),
+                          ),
+                        ],
+                      ),
+                    ),
+                  RadioListTile<String>(
+                    value: "direct",
+                    groupValue: currentMode,
+                    title: const Text("🔴 纯直连模式 (不使用代理)", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: const Text("适合已开启 TUN 虚拟网卡，或使用 Cloudflare 中转域名的用户", style: TextStyle(fontSize: 11)),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+              ElevatedButton(
+                onPressed: () {
+                  AppProxyManager.instance.mode = currentMode;
+                  AppProxyManager.instance.customHost = hostCtrl.text.trim();
+                  AppProxyManager.instance.customPort = int.tryParse(portCtrl.text.trim()) ?? 7890;
+                  _saveConfig();
+                  Navigator.pop(ctx);
+                  LogManager.instance.log("PROXY", "代理已切换为: $currentMode (${AppProxyManager.instance.getProxyString(Uri())})");
+                },
+                child: const Text("保存并立即生效"),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  // ──────────────── 音频解码播放 (核心修复：物理倍速注入) ────────────────
   Future<void> _playAudioFromRam(Uint8List bytes) async {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.setVolume(1.0);
-      // 通道 1：指定精确的 audio/mpeg MIME 类型，Windows Media Foundation 必备
+      
+      // 关键修复 1：在启动音频前，将播放器底层倍速强制同步为设定语速
+      await _audioPlayer.setPlaybackRate(_speed);
       await _audioPlayer.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
+      // 关键修复 2：Windows Media Foundation 加载数据后，再次锚定倍速，确保 100% 硬件变速
+      await _audioPlayer.setPlaybackRate(_speed);
+      
+      LogManager.instance.log("AUDIO", "扬声器正在以真实 [${_speed.toStringAsFixed(2)}x] 语速物理播放音频");
     } catch (e) {
-      LogManager.instance.log("WARN", "BytesSource 播放异常 ($e)，启动 Data-URI 纯 RAM 备用通道...");
       final dataUri = Uri.dataFromBytes(bytes, mimeType: 'audio/mpeg').toString();
+      await _audioPlayer.setPlaybackRate(_speed);
       await _audioPlayer.play(UrlSource(dataUri));
+      await _audioPlayer.setPlaybackRate(_speed);
     }
   }
 
   void _initAudioPlayer() {
     _audioPlayer.onPlayerComplete.listen((_) async {
       if (!_isPlaying || _isPaused) return;
-      LogManager.instance.log("PLAY", "第 ${_currentSentenceIndex + 1} 句播放完毕，停顿 ${_sentenceGapMs}ms");
       await Future.delayed(Duration(milliseconds: _sentenceGapMs));
-
       if (!_isPlaying || _isPaused) return;
 
       if (_currentSentenceIndex + 1 < _sentences.length) {
@@ -457,24 +608,20 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     super.dispose();
   }
 
-  // ──────────────── 发音人即时试听 ────────────────
+  // ──────────────── 发音人试听 ────────────────
   Future<void> _previewVoice(CustomTtsEngine engine, TtsVoice voice) async {
-    LogManager.instance.log("PREVIEW", "正在试听发音人: [${voice.name}] (ID: ${voice.id})...");
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text("正在生成 [${voice.name}] 的试听音频..."),
-      duration: const Duration(seconds: 2),
-    ));
+    LogManager.instance.log("PREVIEW", "正在以 [${_speed.toStringAsFixed(2)}x] 倍速试听发音人: [${voice.name}]...");
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("正在生成 [${voice.name}] 的试听音频..."), duration: const Duration(seconds: 2)));
 
     try {
       final bytes = await UniversalTtsExecutor.synthesize(
         engine: engine,
-        text: "你好，这是一条试听语音。当前正在测试发音人：${voice.name} 的朗读效果。",
+        text: "你好，这是一条试听语音。正在验证发音人：${voice.name} 在当前倍速下的发音效果。",
         voiceId: voice.id,
         speed: _speed,
         bitrate: _bitrate,
       );
       await _playAudioFromRam(bytes);
-      LogManager.instance.log("PREVIEW", "试听音频播放成功！");
     } catch (e) {
       LogManager.instance.log("PREVIEW-ERR", "试听失败: $e");
       if (mounted) {
@@ -482,7 +629,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text("❌ 试听失败"),
-            content: Text("接口返回错误：\n$e\n\n排查建议：\n1. 检查该引擎的 API Key 或 URL 是否有效；\n2. 推荐先切换为 [Cloudflare 中转免密引擎] 验证本地发声硬件。"),
+            content: Text("错误原因：\n$e\n\n排查建议：\n1. 海外官方直连请检查顶部【🌐】代理设置；\n2. 检查 API Key 或密码。"),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("好"))],
           ),
         );
@@ -493,7 +640,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   // ──────────────── 引擎连通性测试 ────────────────
   Future<void> _testEngineConnectivity(CustomTtsEngine engine) async {
     final sw = Stopwatch()..start();
-    LogManager.instance.log("PING", "正在对引擎 [${engine.name}] 进行网络连通性测试...");
+    LogManager.instance.log("PING", "正在对引擎 [${engine.name}] 进行连通性测试...");
 
     try {
       final voiceId = engine.voices.isNotEmpty ? engine.voices.first.id : "default";
@@ -501,11 +648,10 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         engine: engine,
         text: "网络连通性测试成功，语音合成服务正常！",
         voiceId: voiceId,
-        speed: 1.0,
+        speed: _speed,
         bitrate: 64,
       );
       sw.stop();
-
       await _playAudioFromRam(bytes);
 
       if (mounted) {
@@ -515,9 +661,11 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             title: const Text("🎉 连通性测试成功！"),
             content: Text(
               "• 引擎名称: ${engine.name}\n"
-              "• 网络往返与合成耗时: ${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)} 秒\n"
-              "• 接收音频体积: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB\n"
-              "• 音频已在 RAM 中播放验证，如果您能听到声音，说明该引擎完全正常！",
+              "• 网络往返耗时: ${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)} 秒\n"
+              "• 音频体积: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB\n"
+              "• 播放倍速: ${_speed.toStringAsFixed(2)}x\n"
+              "• 当前代理状态: ${AppProxyManager.instance.getProxyString(Uri())}\n\n"
+              "扬声器已播放试听音频，能听到声音且倍速明显加快说明一切正常！",
             ),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("确定"))],
           ),
@@ -525,13 +673,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       }
     } catch (e) {
       sw.stop();
-      LogManager.instance.log("PING-ERR", "连通性测试失败: $e");
+      LogManager.instance.log("PING-ERR", "测试失败: $e");
       if (mounted) {
         showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text("❌ 连通性测试失败"),
-            content: Text("连接失败详情：\n$e\n\n排查指南：\n• 如果是官方直连，请检查 API Key 是否填写；\n• 检查接口地址 URL 是否有回车换行等非法字符。"),
+            content: Text("错误详情：\n$e\n\n排查指南：\n• 如果提示超时，请点击顶栏【🌐】切换代理端口或自动检测；\n• 如果提示 401，请检查密钥是否填写正确。"),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("知道了"))],
           ),
         );
@@ -539,7 +687,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     }
   }
 
-  // ──────────────── 朗读流程控制 ────────────────
+  // ──────────────── 朗读管线 ────────────────
   void _splitSentences() {
     final text = _textController.text;
     if (text.trim().isEmpty) {
@@ -552,7 +700,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         .map((m) => m.group(0)!.trim())
         .where((s) => s.isNotEmpty && RegExp(r'[\w\u4e00-\u9fa5]').hasMatch(s))
         .toList();
-    LogManager.instance.log("TEXT", "文本已切分为 ${_sentences.length} 个独立句子");
+    LogManager.instance.log("TEXT", "文本已切分为 ${_sentences.length} 句");
   }
 
   void _schedulePreload(int currentIndex, int sessionId) {
@@ -567,21 +715,19 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
   Future<void> _fetchToRam(int index, int sessionId) async {
     _inFlightFetches.add(index);
-    final text = _sentences[index];
     try {
       final audioBytes = await UniversalTtsExecutor.synthesize(
         engine: _currentEngine,
-        text: text,
+        text: _sentences[index],
         voiceId: _currentVoice.id,
         speed: _speed,
         bitrate: _bitrate,
       );
       if (sessionId == _playSessionId) {
         _ramAudioCache[index] = audioBytes;
-        LogManager.instance.log("PIPELINE", "第 ${index + 1} 句预读就绪，RAM 缓存: ${_ramAudioCache.length}");
       }
     } catch (e) {
-      LogManager.instance.log("ERROR", "第 ${index + 1} 句获取失败: $e");
+      LogManager.instance.log("ERROR", "第 ${index + 1} 句拉取失败: $e");
     } finally {
       _inFlightFetches.remove(index);
       if (_isPlaying && sessionId == _playSessionId) {
@@ -598,17 +744,15 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     int waitCounter = 0;
     while (!_ramAudioCache.containsKey(idx)) {
       if (!_isPlaying || sessionId != _playSessionId) return;
-      if (!_inFlightFetches.contains(idx)) {
-        _fetchToRam(idx, sessionId);
-      }
+      if (!_inFlightFetches.contains(idx)) _fetchToRam(idx, sessionId);
       await Future.delayed(const Duration(milliseconds: 60));
       waitCounter++;
       if (waitCounter > 300) {
-        _stopPlayback("第 ${idx + 1} 句加载超时");
+        _stopPlayback("第 ${idx + 1} 句加载超时中断");
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             backgroundColor: Colors.red,
-            content: Text("朗读中断：未能获取到音频。请检查当前引擎配置、密钥或查看右下角日志！"),
+            content: Text("朗读中断：未能获取到音频。请点击右上角【🌐】检查代理或查看日志！"),
           ));
         }
         return;
@@ -616,14 +760,12 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     }
 
     if (!_isPlaying || sessionId != _playSessionId) return;
-    final Uint8List audioBytes = _ramAudioCache[idx]!;
-    LogManager.instance.log("AUDIO", "▶️ 正在从 RAM 播放第 ${idx + 1}/${_sentences.length} 句");
-    await _playAudioFromRam(audioBytes);
+    await _playAudioFromRam(_ramAudioCache[idx]!);
   }
 
   void _startPlayback() {
     if (_textController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("请先输入或拖入文本！")));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("请先输入或拖入小说文本！")));
       return;
     }
     _splitSentences();
@@ -664,30 +806,22 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     });
     _ramAudioCache.clear();
     _inFlightFetches.clear();
-    LogManager.instance.log("CTRL", reason ?? "朗读已停止，RAM 音频已释放");
+    LogManager.instance.log("CTRL", reason ?? "朗读停止");
   }
 
   Future<void> _exportAudio() async {
-    if (_textController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("文本为空，无法导出！")));
-      return;
-    }
-
+    if (_textController.text.trim().isEmpty) return;
     final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '选择导出的音频保存路径',
+      dialogTitle: '选择保存音频文件',
       fileName: 'TTS_Export_${DateTime.now().millisecondsSinceEpoch}.mp3',
       type: FileType.custom,
       allowedExtensions: ['mp3'],
     );
-
     if (savePath == null) return;
 
     _splitSentences();
-    LogManager.instance.log("EXPORT", "开始批量合成并导出: $savePath");
-
     final exportBytes = BytesBuilder();
     for (int i = 0; i < _sentences.length; i++) {
-      LogManager.instance.log("EXPORT", "正在合成第 ${i + 1}/${_sentences.length} 句...");
       try {
         final b = await UniversalTtsExecutor.synthesize(
           engine: _currentEngine,
@@ -701,14 +835,11 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         LogManager.instance.log("EXPORT-ERR", "第 ${i + 1} 句失败: $e");
       }
     }
-
-    final file = File(savePath);
-    await file.writeAsBytes(exportBytes.toBytes());
-    LogManager.instance.log("EXPORT", "🎉 导出全部完成！大小: ${(file.lengthSync() / 1024).toStringAsFixed(1)} KB");
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("音频已导出至：$savePath")));
+    await File(savePath).writeAsBytes(exportBytes.toBytes());
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("音频已成功导出至：$savePath")));
   }
 
-  // ──────────────── 引擎与发音人管理器弹窗 ────────────────
+  // ──────────────── 引擎管理弹窗 ────────────────
   void _openEngineManagerDialog() {
     showDialog(
       context: context,
@@ -718,46 +849,27 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const Text("⚙️ TTS 引擎管理与自由定义", style: TextStyle(fontWeight: FontWeight.bold)),
-              Row(
-                children: [
-                  OutlinedButton.icon(
-                    icon: const Icon(Icons.file_upload, size: 16),
-                    label: const Text("恢复备份"),
-                    onPressed: () async {
-                      Navigator.pop(ctx);
-                      await _importBackupDialog();
-                    },
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    icon: const Icon(Icons.file_download, size: 16),
-                    label: const Text("导出备份"),
-                    onPressed: _exportBackupDialog,
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.add, size: 16),
-                    label: const Text("新增引擎"),
-                    onPressed: () async {
-                      final newEngine = await _showEditEngineDialog();
-                      if (newEngine != null) {
-                        setDlgState(() {
-                          _engines.add(newEngine);
-                          _currentEngine = newEngine;
-                          _currentVoice = newEngine.voices.isNotEmpty ? newEngine.voices.first : TtsVoice(id: "", name: "无发音人");
-                        });
-                        _saveConfig();
-                        setState(() {});
-                      }
-                    },
-                  ),
-                ],
+              ElevatedButton.icon(
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text("新增引擎"),
+                onPressed: () async {
+                  final newEngine = await _showEditEngineDialog();
+                  if (newEngine != null) {
+                    setDlgState(() {
+                      _engines.add(newEngine);
+                      _currentEngine = newEngine;
+                      _currentVoice = newEngine.voices.first;
+                    });
+                    _saveConfig();
+                    setState(() {});
+                  }
+                },
               ),
             ],
           ),
           content: SizedBox(
-            width: 760,
-            height: 480,
+            width: 740,
+            height: 460,
             child: ListView.separated(
               itemCount: _engines.length,
               separatorBuilder: (_, __) => const Divider(),
@@ -772,7 +884,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.network_check, color: Colors.teal),
-                        tooltip: "测试该引擎连通性与发声",
+                        tooltip: "测试该引擎连通性与倍速发声",
                         onPressed: () => _testEngineConnectivity(eng),
                       ),
                       IconButton(
@@ -783,10 +895,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                           if (updated != null) {
                             setDlgState(() {
                               _engines[idx] = updated;
-                              if (_currentEngine.id == eng.id) {
-                                _currentEngine = updated;
-                                _currentVoice = updated.voices.isNotEmpty ? updated.voices.first : TtsVoice(id: "", name: "无");
-                              }
+                              if (_currentEngine.id == eng.id) _currentEngine = updated;
                             });
                             _saveConfig();
                             setState(() {});
@@ -799,10 +908,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                         onPressed: _engines.length <= 1 ? null : () {
                           setDlgState(() {
                             _engines.removeAt(idx);
-                            if (_currentEngine.id == eng.id) {
-                              _currentEngine = _engines.first;
-                              _currentVoice = _currentEngine.voices.first;
-                            }
+                            if (_currentEngine.id == eng.id) _currentEngine = _engines.first;
                           });
                           _saveConfig();
                           setState(() {});
@@ -814,13 +920,12 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               },
             ),
           ),
-          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完成"))],
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("关闭"))],
         ),
       ),
     );
   }
 
-  // 自由编辑/新建引擎规则
   Future<CustomTtsEngine?> _showEditEngineDialog({CustomTtsEngine? existing}) async {
     final nameCtrl = TextEditingController(text: existing?.name ?? "自定义 TTS 引擎");
     final urlCtrl = TextEditingController(text: existing?.urlTemplate ?? "https://api.your-tts.com/v1/tts");
@@ -840,18 +945,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSubState) => AlertDialog(
-          title: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(existing == null ? "新增自定义 TTS 引擎" : "编辑规则: ${existing.name}"),
-              if (existing != null)
-                TextButton.icon(
-                  icon: const Icon(Icons.network_check, color: Colors.teal),
-                  label: const Text("连通性即时测试"),
-                  onPressed: () => _testEngineConnectivity(existing),
-                )
-            ],
-          ),
+          title: Text(existing == null ? "新增自定义 TTS 引擎" : "编辑规则: ${existing.name}"),
           content: SizedBox(
             width: 700,
             child: SingleChildScrollView(
@@ -880,7 +974,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   const Text("请求头 Headers (JSON 格式):", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
                   TextField(controller: headersCtrl, maxLines: 4, decoration: const InputDecoration(border: OutlineInputBorder())),
                   const SizedBox(height: 10),
-                  const Text("请求体 Body 模板 (POST 时生效，支持 {{text}}, {{voice}}):", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  const Text("请求体 Body 模板 (POST 时生效):", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
                   TextField(controller: bodyCtrl, maxLines: 4, decoration: const InputDecoration(border: OutlineInputBorder())),
                   const SizedBox(height: 10),
                   const Text("音频响应解析格式:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
@@ -896,19 +990,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   ),
                   if (respType != AudioResponseType.binaryStream) ...[
                     const SizedBox(height: 8),
-                    TextField(
-                      controller: jsonPathCtrl,
-                      decoration: const InputDecoration(
-                        labelText: "JSON 音频提取路径 (如 choices[0].message.audio.data)",
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
+                    TextField(controller: jsonPathCtrl, decoration: const InputDecoration(labelText: "JSON 音频提取路径", border: OutlineInputBorder())),
                   ],
                   const Divider(height: 25),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text("发音人列表 (支持试听与增删改):", style: TextStyle(fontWeight: FontWeight.bold)),
+                      const Text("发音人列表 (支持试听与管理):", style: TextStyle(fontWeight: FontWeight.bold)),
                       ElevatedButton.icon(
                         icon: const Icon(Icons.add, size: 16),
                         label: const Text("添加发音人"),
@@ -921,7 +1009,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   ),
                   const SizedBox(height: 6),
                   Container(
-                    height: 130,
+                    height: 120,
                     decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(6)),
                     child: ListView.builder(
                       itemCount: voices.length,
@@ -929,25 +1017,9 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                         dense: true,
                         title: Text(voices[i].name),
                         subtitle: Text("ID: ${voices[i].id}"),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.volume_up, size: 18, color: Colors.deepPurple),
-                              tooltip: "试听该音色",
-                              onPressed: () {
-                                if (existing != null) {
-                                  _previewVoice(existing, voices[i]);
-                                } else {
-                                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("请先保存引擎后再试听发音人！")));
-                                }
-                              },
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.delete, size: 18, color: Colors.red),
-                              onPressed: () => setSubState(() => voices.removeAt(i)),
-                            ),
-                          ],
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete, size: 18, color: Colors.red),
+                          onPressed: () => setSubState(() => voices.removeAt(i)),
                         ),
                       ),
                     ),
@@ -963,9 +1035,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                 Map<String, String> parsedHeaders = {};
                 try {
                   final decoded = jsonDecode(headersCtrl.text);
-                  if (decoded is Map) {
-                    decoded.forEach((k, v) => parsedHeaders[k.toString()] = v.toString());
-                  }
+                  if (decoded is Map) decoded.forEach((k, v) => parsedHeaders[k.toString()] = v.toString());
                 } catch (_) {}
 
                 final res = CustomTtsEngine(
@@ -999,9 +1069,9 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "显示名称 (如: 甜美播音)")),
+            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "发音人名称")),
             const SizedBox(height: 8),
-            TextField(controller: idCtrl, decoration: const InputDecoration(labelText: "发音人 ID (填入接口所需值)")),
+            TextField(controller: idCtrl, decoration: const InputDecoration(labelText: "发音人 ID")),
           ],
         ),
         actions: [
@@ -1019,21 +1089,26 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // ──────────────── 界面布局 ────────────────
+  // ──────────────── 页面主布局 ────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("万能 TTS 朗读与评测工具 (纯内存/零落盘版)"),
+        title: const Text("万能 TTS 朗读与发音人评测工具 (纯内存版)"),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
-            tooltip: "备份/恢复配置或管理自定义 TTS 引擎",
+            tooltip: "全局网络与代理配置 (自动检测/自定义端口)",
+            icon: const Icon(Icons.lan, color: Colors.indigo),
+            onPressed: _openProxySettingsDialog,
+          ),
+          IconButton(
+            tooltip: "自定义/添加/修改 TTS 引擎规则",
             icon: const Icon(Icons.tune),
             onPressed: _openEngineManagerDialog,
           ),
           IconButton(
-            tooltip: "合成并导出为 MP3 文件",
+            tooltip: "批量合成导出为 MP3 文件",
             icon: const Icon(Icons.save_alt),
             onPressed: _exportAudio,
           ),
@@ -1053,10 +1128,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           ),
           Container(
             width: 320,
-            decoration: BoxDecoration(
-              color: Colors.grey.shade100,
-              border: Border(left: BorderSide(color: Colors.grey.shade300)),
-            ),
+            decoration: BoxDecoration(color: Colors.grey.shade100, border: Border(left: BorderSide(color: Colors.grey.shade300))),
             child: Column(
               children: [
                 _buildSidebarSettings(),
@@ -1070,7 +1142,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 顶栏控制栏
   Widget _buildTopControlBar() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1082,9 +1153,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         children: [
           DropdownButton<CustomTtsEngine>(
             value: _currentEngine,
-            items: _engines
-                .map((e) => DropdownMenuItem(value: e, child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.bold))))
-                .toList(),
+            items: _engines.map((e) => DropdownMenuItem(value: e, child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.bold)))).toList(),
             onChanged: (e) {
               if (e != null) {
                 setState(() {
@@ -1105,13 +1174,14 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               }
             },
           ),
-          // 核心功能：发音人一键试听
+          // 发音人试听按钮
           ElevatedButton.icon(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple, foregroundColor: Colors.white),
             icon: const Icon(Icons.volume_up, size: 16),
             label: const Text("试听"),
             onPressed: () => _previewVoice(_currentEngine, _currentVoice),
           ),
+          // 关键修复：滑块拖动实时动态生效，边拖边变速
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1126,6 +1196,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   label: "${_speed}x",
                   onChanged: (val) {
                     setState(() => _speed = val);
+                    // 核心：直接向播放器发送实时变速指令
+                    _audioPlayer.setPlaybackRate(val);
                     _saveConfig();
                   },
                 ),
@@ -1135,10 +1207,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           ),
           DropdownButton<int>(
             value: _bitrate,
-            items: const [
-              DropdownMenuItem(value: 64, child: Text("省流 64k")),
-              DropdownMenuItem(value: 128, child: Text("高清 128k")),
-            ],
+            items: const [DropdownMenuItem(value: 64, child: Text("省流 64k")), DropdownMenuItem(value: 128, child: Text("高清 128k"))],
             onChanged: (b) {
               setState(() => _bitrate = b ?? 64);
               _saveConfig();
@@ -1167,7 +1236,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 文本编辑展示区
   Widget _buildDragAndDropTextArea() {
     return Expanded(
       child: DropTarget(
@@ -1178,7 +1246,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             setState(() => _textController.text = content);
             LogManager.instance.log("FILE", "成功拖入文档: ${file.name} (大小: ${content.length} 字符)");
           } else {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖入 .txt 和 .md 格式小说文件！")));
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖入 .txt 和 .md 格式文件！")));
           }
         },
         child: Container(
@@ -1204,7 +1272,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   expands: true,
                   textAlignVertical: TextAlignVertical.top,
                   decoration: const InputDecoration(
-                    hintText: "【使用提示】\n1. 选中发音人后可点击上方【试听】直接发声\n2. 默认推荐使用 [Cloudflare 中转免密引擎]，开箱即听\n3. 可按 Ctrl+V 粘贴任意文字，或拖拽 .txt / .md 小说进入本区域\n4. 点击右上角【⚙️ 图标】可测试引擎连通性、备份或添加任何新 TTS",
+                    hintText: "【快捷提示】\n1. 支持直接拖入 .txt/.md 小说或 Ctrl+V 粘贴文本\n2. 语速滑块支持在播放中【边播边拉】，实时变速不变调\n3. 点击发音人右侧【试听】直接发声验证\n4. 点击右上角【🌐】可一键切换代理模式",
                     border: InputBorder.none,
                   ),
                 ),
@@ -1216,7 +1284,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 右侧参数控制
   Widget _buildSidebarSettings() {
     return Padding(
       padding: const EdgeInsets.all(12),
@@ -1263,7 +1330,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  // 调试日志窗口 (支持文件导出备份)
   Widget _buildLiveLogConsole() {
     return Expanded(
       child: Container(
@@ -1314,10 +1380,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                     itemCount: logs.length,
                     itemBuilder: (ctx, idx) => Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      child: Text(
-                        logs[idx],
-                        style: const TextStyle(color: Colors.lightGreenAccent, fontFamily: "Consolas", fontSize: 11),
-                      ),
+                      child: Text(logs[idx], style: const TextStyle(color: Colors.lightGreenAccent, fontFamily: "Consolas", fontSize: 11)),
                     ),
                   );
                 },
