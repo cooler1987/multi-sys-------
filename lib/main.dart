@@ -649,7 +649,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
   Widget _buildTopControlBar() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, pady: 8),
+      // 关键修复 1：把之前的 pady 改为标准的 vertical
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       color: Colors.grey.shade200,
       child: Wrap(
         spacing: 12,
@@ -822,7 +823,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         child: Column(
           children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, pady: 4),
+              // 关键修复 2：把之前的 pady 改为标准的 vertical
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               color: Colors.black54,
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
