@@ -40,140 +40,140 @@ class LogManager {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. 数据模型：发音人与引擎配置
+// 2. 通用自定义 TTS 引擎模型 (支持用户自由拓展任何协议)
 // ─────────────────────────────────────────────────────────────
+enum AudioResponseType {
+  binaryStream, // 直接返回二进制音频数据流 (如 Fish.audio, Edge-TTS, 自建中转)
+  jsonBase64,   // 从 JSON 的指定路径提取 Base64 编码 (如 MiMo, OpenAI)
+  jsonUrl,      // 从 JSON 的指定路径提取音频下载 URL
+}
+
 class TtsVoice {
   String id;
   String name;
   TtsVoice({required this.id, required this.name});
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name};
+  factory TtsVoice.fromJson(Map<String, dynamic> j) => TtsVoice(id: j['id'] ?? '', name: j['name'] ?? '');
 }
 
-class TtsEngine {
+class CustomTtsEngine {
   String id;
   String name;
-  String type; // 'fish_audio' | 'mimo'
-  String endpoint;
-  String apiKey;
+  String method; // 'GET' 或 'POST'
+  String urlTemplate; // 支持 {{text}}, {{voice}}, {{speed}}, {{bitrate}}
+  Map<String, String> headers;
+  String bodyTemplate; // POST 请求体模板，支持占位符
+  AudioResponseType responseType;
+  String jsonExtractPath; // 如 choices[0].message.audio.data
   List<TtsVoice> voices;
 
-  TtsEngine({
+  CustomTtsEngine({
     required this.id,
     required this.name,
-    required this.type,
-    required this.endpoint,
-    required this.apiKey,
+    required this.method,
+    required this.urlTemplate,
+    required this.headers,
+    required this.bodyTemplate,
+    required this.responseType,
+    required this.jsonExtractPath,
     required this.voices,
   });
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. 内存 TTS 网络调度引擎 (完全不触碰硬盘)
+// 3. 通用网络执行器 (纯 RAM 处理，绝不写硬盘)
 // ─────────────────────────────────────────────────────────────
-class TtsService {
+class UniversalTtsExecutor {
   static Future<Uint8List> synthesize({
-    required TtsEngine engine,
+    required CustomTtsEngine engine,
     required String text,
     required String voiceId,
     required double speed,
     required int bitrate,
   }) async {
-    LogManager.instance.log("TTS-REQ", "正在请求 [${engine.name}] 引擎, 发音人ID: $voiceId, 字数: ${text.length}");
+    LogManager.instance.log("EXEC", "正在调用引擎 [${engine.name}]，发音人: $voiceId，字数: ${text.length}");
 
-    if (engine.type == 'fish_audio') {
-      return await _requestFishAudio(engine, text, voiceId, speed, bitrate);
-    } else if (engine.type == 'mimo') {
-      return await _requestMimo(engine, text, voiceId, speed, bitrate);
+    // 占位符安全替换
+    String replacePlaceholders(String input, {bool isUrl = false}) {
+      String processedText = isUrl ? Uri.encodeComponent(text) : jsonEncode(text).replaceFirst(RegExp(r'^"'), '').replaceFirst(RegExp(r'"$'), '');
+      return input
+          .replaceAll('{{text}}', processedText)
+          .replaceAll('{{voice}}', voiceId)
+          .replaceAll('{{speed}}', speed.toStringAsFixed(2))
+          .replaceAll('{{bitrate}}', bitrate.toString());
+    }
+
+    final targetUrl = Uri.parse(replacePlaceholders(engine.urlTemplate, isUrl: true));
+    final processedHeaders = <String, String>{};
+    engine.headers.forEach((k, v) {
+      processedHeaders[k] = replacePlaceholders(v);
+    });
+
+    http.Response res;
+    if (engine.method.toUpperCase() == 'POST') {
+      final processedBody = replacePlaceholders(engine.bodyTemplate);
+      res = await http.post(targetUrl, headers: processedHeaders, body: processedBody);
     } else {
-      throw Exception("未知的引擎类型: ${engine.type}");
+      res = await http.get(targetUrl, headers: processedHeaders);
+    }
+
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception("接口返回错误 (HTTP ${res.statusCode}):\n${utf8.decode(res.bodyBytes, allowMalformed: true)}");
+    }
+
+    // 根据用户配置的响应规则提取音频进入内存
+    switch (engine.responseType) {
+      case AudioResponseType.binaryStream:
+        LogManager.instance.log("RAM", "二进制音频流已载入内存，大小: ${(res.bodyBytes.lengthInBytes / 1024).toStringAsFixed(1)} KB");
+        return res.bodyBytes;
+
+      case AudioResponseType.jsonBase64:
+        final jsonObj = jsonDecode(utf8.decode(res.bodyBytes));
+        final base64Str = _extractByPath(jsonObj, engine.jsonExtractPath);
+        if (base64Str == null || base64Str is! String || base64Str.isEmpty) {
+          throw Exception("无法从 JSON 路径 [${engine.jsonExtractPath}] 提取到有效的 Base64 音频数据");
+        }
+        final bytes = base64Decode(base64Str.replaceAll(RegExp(r'\s+'), ''));
+        LogManager.instance.log("RAM", "Base64 解码至内存完毕，大小: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB");
+        return bytes;
+
+      case AudioResponseType.jsonUrl:
+        final jsonObj = jsonDecode(utf8.decode(res.bodyBytes));
+        final audioUrl = _extractByPath(jsonObj, engine.jsonExtractPath);
+        if (audioUrl == null || audioUrl is! String || audioUrl.isEmpty) {
+          throw Exception("无法从 JSON 路径 [${engine.jsonExtractPath}] 提取到音频下载链接");
+        }
+        LogManager.instance.log("NET", "正在从提取到的 URL 下载音频到 RAM: $audioUrl");
+        final dlRes = await http.get(Uri.parse(audioUrl));
+        return dlRes.bodyBytes;
     }
   }
 
-  static Future<Uint8List> _requestFishAudio(
-    TtsEngine engine,
-    String text,
-    String voiceId,
-    double speed,
-    int bitrate,
-  ) async {
-    final uri = Uri.parse(engine.endpoint.isNotEmpty ? engine.endpoint : "https://api.fish.audio/v1/tts");
-    final body = jsonEncode({
-      "text": text,
-      "reference_id": voiceId,
-      "format": "mp3",
-      "mp3_bitrate": bitrate,
-      "chunk_length": 100,
-      "latency": "balanced",
-      "prosody": {"speed": speed}
-    });
+  // 简易层级属性提取器 (支持 data.audio 以及 choices[0].message 等路径格式)
+  static dynamic _extractByPath(dynamic root, String path) {
+    if (path.trim().isEmpty) return root;
+    final segments = path.split('.');
+    dynamic current = root;
 
-    final res = await http.post(
-      uri,
-      headers: {
-        "Authorization": "Bearer ${engine.apiKey.trim()}",
-        "Content-Type": "application/json",
-        "model": "s2.1-pro-free",
-      },
-      body: body,
-    );
-
-    if (res.statusCode == 200) {
-      LogManager.instance.log("TTS-RAM", "Fish.Audio 数据已接收进 RAM，大小: ${(res.bodyBytes.lengthInBytes / 1024).toStringAsFixed(1)} KB");
-      return res.bodyBytes;
-    } else {
-      throw Exception("Fish Audio 错误 (${res.statusCode}): ${utf8.decode(res.bodyBytes)}");
-    }
-  }
-
-  static Future<Uint8List> _requestMimo(
-    TtsEngine engine,
-    String text,
-    String voiceId,
-    double speed,
-    int bitrate,
-  ) async {
-    final uri = Uri.parse(engine.endpoint.isNotEmpty ? engine.endpoint : "https://api.xiaomimimo.com/v1/chat/completions");
-    
-    final messages = [
-      if ((speed - 1.0).abs() >= 0.05)
-        {"role": "user", "content": "请以约 ${speed.toStringAsFixed(2)} 倍的较快语速朗读，吐字清晰流利。"},
-      {"role": "assistant", "content": text}
-    ];
-
-    final body = jsonEncode({
-      "model": "mimo-v2.5-tts",
-      "messages": messages,
-      "audio": {
-        "voice": voiceId,
-        "format": "mp3"
+    for (var seg in segments) {
+      if (seg.contains('[') && seg.endsWith(']')) {
+        final key = seg.substring(0, seg.indexOf('['));
+        final indexStr = seg.substring(seg.indexOf('[') + 1, seg.length - 1);
+        if (key.isNotEmpty) current = current[key];
+        final idx = int.tryParse(indexStr) ?? 0;
+        current = current[idx];
+      } else {
+        current = current[seg];
       }
-    });
-
-    final res = await http.post(
-      uri,
-      headers: {
-        "Authorization": "Bearer ${engine.apiKey.trim()}",
-        "Content-Type": "application/json",
-      },
-      body: body,
-    );
-
-    if (res.statusCode == 200) {
-      final jsonResp = jsonDecode(utf8.decode(res.bodyBytes));
-      final audioBase64 = jsonResp["choices"]?[0]?["message"]?["audio"]?["data"];
-      if (audioBase64 == null) {
-        throw Exception("MiMo 响应未找到音频数据");
-      }
-      final bytes = base64Decode(audioBase64);
-      LogManager.instance.log("TTS-RAM", "MiMo 音频已 Base64 解码至 RAM，大小: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB");
-      return bytes;
-    } else {
-      throw Exception("MiMo 接口错误 (${res.statusCode}): ${utf8.decode(res.bodyBytes)}");
+      if (current == null) return null;
     }
+    return current;
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. 主界面
+// 4. 主程序界面
 // ─────────────────────────────────────────────────────────────
 class TtsReaderApp extends StatelessWidget {
   const TtsReaderApp({super.key});
@@ -181,9 +181,9 @@ class TtsReaderApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '多音色 TTS 朗读工具 (Win10 原生纯内存版)',
+      title: '多音色 TTS 自由配置朗读工具 (Windows 10 纯内存版)',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
       ),
       home: const ReaderHomePage(),
@@ -203,58 +203,89 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   final ScrollController _logScrollController = ScrollController();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  late List<TtsEngine> _engines;
-  late TtsEngine _currentEngine;
+  // 动态引擎列表（用户可自由在此增删改查任何新 TTS）
+  late List<CustomTtsEngine> _engines;
+  late CustomTtsEngine _currentEngine;
   late TtsVoice _currentVoice;
 
+  // 调节参数
   double _speed = 1.75;
   int _bitrate = 64;
   int _preloadCount = 4;
   int _concurrency = 2;
-  int _sentenceGapMs = 250;
+  int _sentenceGapMs = 200;
 
+  // 播放调度
   List<String> _sentences = [];
   int _currentSentenceIndex = -1;
   bool _isPlaying = false;
   bool _isPaused = false;
   int _playSessionId = 0;
 
+  // 纯 RAM 内存池
   final Map<int, Uint8List> _ramAudioCache = {};
   final Set<int> _inFlightFetches = {};
 
   @override
   void initState() {
     super.initState();
-    _initEngines();
+    _initDefaultEngines();
     _initAudioPlayer();
   }
 
-  void _initEngines() {
+  // 初始化内置预设（仅作为范例，用户可随时在界面上编辑、新增其他任何 TTS）
+  void _initDefaultEngines() {
     _engines = [
-      TtsEngine(
-        id: "fish",
-        name: "Fish.Audio (官方/中转)",
-        type: "fish_audio",
-        endpoint: "https://api.fish.audio/v1/tts",
-        apiKey: "",
+      CustomTtsEngine(
+        id: "fish_audio_template",
+        name: "Fish.Audio 官方/中转模板",
+        method: "POST",
+        urlTemplate: "https://api.fish.audio/v1/tts",
+        headers: {
+          "Authorization": "Bearer 你的FishAudio密钥",
+          "Content-Type": "application/json",
+          "model": "s2.1-pro-free"
+        },
+        bodyTemplate: jsonEncode({
+          "text": "{{text}}",
+          "reference_id": "{{voice}}",
+          "format": "mp3",
+          "mp3_bitrate": 64,
+          "chunk_length": 100,
+          "latency": "balanced",
+          "prosody": {"speed": 1.75}
+        }),
+        responseType: AudioResponseType.binaryStream,
+        jsonExtractPath: "",
         voices: [
-          TtsVoice(id: "a688f2129bea41d1ae6042462892ecf8", name: "推荐主力男声"),
-          TtsVoice(id: "cf71d823861b4e0eadff1672d646da36", name: "几何女声(知性自然)"),
-          TtsVoice(id: "ef078859f29145918ddaf061fc1ce479", name: "刘湘湘(中年自然)"),
-          TtsVoice(id: "6116079467e945f5b0c9b51859c29a02", name: "男声财经(专业快速)"),
+          TtsVoice(id: "a688f2129bea41d1ae6042462892ecf8", name: "通用小说男声"),
+          TtsVoice(id: "cf71d823861b4e0eadff1672d646da36", name: "几何知性女声"),
         ],
       ),
-      TtsEngine(
-        id: "mimo",
-        name: "小米 MiMo-TTS",
-        type: "mimo",
-        endpoint: "https://api.xiaomimimo.com/v1/chat/completions",
-        apiKey: "",
+      CustomTtsEngine(
+        id: "mimo_template",
+        name: "小米 MiMo-TTS 模板",
+        method: "POST",
+        urlTemplate: "https://api.xiaomimimo.com/v1/chat/completions",
+        headers: {
+          "Authorization": "Bearer 你的MIMO密钥",
+          "Content-Type": "application/json"
+        },
+        bodyTemplate: jsonEncode({
+          "model": "mimo-v2.5-tts",
+          "messages": [
+            {"role": "user", "content": "请以较快语速朗读，声音清晰自然"},
+            {"role": "assistant", "content": "{{text}}"}
+          ],
+          "audio": {"voice": "{{voice}}", "format": "mp3"}
+        }),
+        responseType: AudioResponseType.jsonBase64,
+        jsonExtractPath: "choices[0].message.audio.data",
         voices: [
-          TtsVoice(id: "茉莉", name: "茉莉 (温柔知性)"),
-          TtsVoice(id: "冰糖", name: "冰糖 (清澈甜美)"),
-          TtsVoice(id: "苏打", name: "苏打 (阳光男声)"),
-          TtsVoice(id: "白桦", name: "白桦 (磁性深沉)"),
+          TtsVoice(id: "茉莉", name: "茉莉 (温柔女声)"),
+          TtsVoice(id: "冰糖", name: "冰糖 (甜美女声)"),
+          TtsVoice(id: "苏打", name: "苏打 (活力男声)"),
+          TtsVoice(id: "白桦", name: "白桦 (磁性男声)"),
         ],
       ),
     ];
@@ -266,15 +297,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     _audioPlayer.onPlayerComplete.listen((_) async {
       if (!_isPlaying || _isPaused) return;
 
-      LogManager.instance.log("PLAYER", "第 ${_currentSentenceIndex + 1} 句播放完毕，等待 ${_sentenceGapMs}ms 间隔");
+      LogManager.instance.log("PLAY", "第 ${_currentSentenceIndex + 1} 句播放完毕，停顿 ${_sentenceGapMs}ms");
       await Future.delayed(Duration(milliseconds: _sentenceGapMs));
 
       if (!_isPlaying || _isPaused) return;
 
       if (_currentSentenceIndex + 1 < _sentences.length) {
-        setState(() {
-          _currentSentenceIndex++;
-        });
+        setState(() => _currentSentenceIndex++);
         _playCurrentSentence();
       } else {
         _stopPlayback("全文朗读已顺利完成！");
@@ -302,7 +331,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         .map((m) => m.group(0)!.trim())
         .where((s) => s.isNotEmpty && RegExp(r'[\w\u4e00-\u9fa5]').hasMatch(s))
         .toList();
-    LogManager.instance.log("TEXT", "文本已分句，共计 ${_sentences.length} 句");
+    LogManager.instance.log("TEXT", "文本成功切分为 ${_sentences.length} 个独立句子");
   }
 
   void _schedulePreload(int currentIndex, int sessionId) {
@@ -312,9 +341,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     for (int i = currentIndex; i < targetEnd; i++) {
       if (_ramAudioCache.containsKey(i) || _inFlightFetches.contains(i)) continue;
 
-      if (_inFlightFetches.length >= _concurrency) {
-        break;
-      }
+      if (_inFlightFetches.length >= _concurrency) break;
 
       _fetchToRam(i, sessionId);
     }
@@ -325,7 +352,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     final sentenceText = _sentences[index];
 
     try {
-      final audioData = await TtsService.synthesize(
+      final audioBytes = await UniversalTtsExecutor.synthesize(
         engine: _currentEngine,
         text: sentenceText,
         voiceId: _currentVoice.id,
@@ -334,8 +361,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       );
 
       if (sessionId == _playSessionId) {
-        _ramAudioCache[index] = audioData;
-        LogManager.instance.log("PIPELINE", "第 ${index + 1} 句预读就绪，当前 RAM 缓存条数: ${_ramAudioCache.length}");
+        _ramAudioCache[index] = audioBytes;
+        LogManager.instance.log("PIPELINE", "第 ${index + 1} 句预读就绪，当前内存缓冲条数: ${_ramAudioCache.length}");
       }
     } catch (e) {
       LogManager.instance.log("ERROR", "第 ${index + 1} 句获取失败: $e");
@@ -360,9 +387,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       }
       await Future.delayed(const Duration(milliseconds: 60));
       waitCounter++;
-      if (waitCounter > 300) {
-        LogManager.instance.log("TIMEOUT", "第 ${idx + 1} 句加载超时");
-        _stopPlayback("第 ${idx + 1} 句音频加载超时，已停止。");
+      if (waitCounter > 350) {
+        _stopPlayback("第 ${idx + 1} 句加载超时中断");
         return;
       }
     }
@@ -370,17 +396,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     if (!_isPlaying || sessionId != _playSessionId) return;
 
     final Uint8List audioBytes = _ramAudioCache[idx]!;
-    LogManager.instance.log("AUDIO", "▶️ 正在通过 RAM 播放第 ${idx + 1}/${_sentences.length} 句: ${_sentences[idx]}");
+    LogManager.instance.log("AUDIO", "▶️ 正在通过 RAM 播放第 ${idx + 1}/${_sentences.length} 句");
     await _audioPlayer.play(BytesSource(audioBytes));
   }
 
   void _startPlayback() {
     if (_textController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("请先输入或拖入文本内容！")));
-      return;
-    }
-    if (_currentEngine.apiKey.trim().isEmpty) {
-      _showEngineConfigDialog();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("请先输入或拖入文本！")));
       return;
     }
 
@@ -402,15 +424,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
   void _togglePause() {
     if (!_isPlaying) return;
-    setState(() {
-      _isPaused = !_isPaused;
-    });
+    setState(() => _isPaused = !_isPaused);
     if (_isPaused) {
       _audioPlayer.pause();
-      LogManager.instance.log("CONTROL", "朗读已暂停");
+      LogManager.instance.log("CTRL", "朗读已暂停");
     } else {
       _audioPlayer.resume();
-      LogManager.instance.log("CONTROL", "朗读已继续");
+      LogManager.instance.log("CTRL", "朗读已恢复");
     }
   }
 
@@ -424,21 +444,17 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     });
     _ramAudioCache.clear();
     _inFlightFetches.clear();
-    LogManager.instance.log("CONTROL", reason ?? "朗读已停止，RAM 缓存已释放");
+    LogManager.instance.log("CTRL", reason ?? "朗读已停止，RAM 音频已彻底释放");
   }
 
   Future<void> _exportAudio() async {
     if (_textController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("没有可导出的正文！")));
-      return;
-    }
-    if (_currentEngine.apiKey.trim().isEmpty) {
-      _showEngineConfigDialog();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("文本为空，无法导出！")));
       return;
     }
 
     final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '选择导出的音频文件保存路径',
+      dialogTitle: '选择导出的音频保存路径',
       fileName: 'TTS_Export_${DateTime.now().millisecondsSinceEpoch}.mp3',
       type: FileType.custom,
       allowedExtensions: ['mp3'],
@@ -447,13 +463,13 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     if (savePath == null) return;
 
     _splitSentences();
-    LogManager.instance.log("EXPORT", "开始批量合成导出，目标路径: $savePath");
+    LogManager.instance.log("EXPORT", "开始批量合成并导出文件: $savePath");
 
     final exportBytes = BytesBuilder();
     for (int i = 0; i < _sentences.length; i++) {
       LogManager.instance.log("EXPORT", "正在合成第 ${i + 1}/${_sentences.length} 句...");
       try {
-        final b = await TtsService.synthesize(
+        final b = await UniversalTtsExecutor.synthesize(
           engine: _currentEngine,
           text: _sentences[i],
           voiceId: _currentVoice.id,
@@ -468,98 +484,238 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
     final file = File(savePath);
     await file.writeAsBytes(exportBytes.toBytes());
-    LogManager.instance.log("EXPORT", "🎉 导出完成！总大小: ${(file.lengthSync() / 1024).toStringAsFixed(1)} KB");
+    LogManager.instance.log("EXPORT", "🎉 导出全部完成！大小: ${(file.lengthSync() / 1024).toStringAsFixed(1)} KB");
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("音频已成功导出至：$savePath")));
     }
   }
 
-  void _showEngineConfigDialog() {
-    final apiKeyController = TextEditingController(text: _currentEngine.apiKey);
-    final endpointController = TextEditingController(text: _currentEngine.endpoint);
-
+  // ─────────────────────────────────────────────────────────────
+  // 5. 核心：万能引擎与发音人管理器 (支持用户自由增删改任何 TTS)
+  // ─────────────────────────────────────────────────────────────
+  void _openEngineManagerDialog() {
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlgState) => AlertDialog(
-          title: Text("配置当前引擎：${_currentEngine.name}"),
+          title: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text("⚙️ TTS 引擎管理与自由定义", style: TextStyle(fontWeight: FontWeight.bold)),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.add),
+                label: const Text("新增自定义 TTS 引擎"),
+                onPressed: () async {
+                  final newEngine = await _showEditEngineDialog();
+                  if (newEngine != null) {
+                    setDlgState(() {
+                      _engines.add(newEngine);
+                      _currentEngine = newEngine;
+                      _currentVoice = newEngine.voices.isNotEmpty ? newEngine.voices.first : TtsVoice(id: "", name: "无发音人");
+                    });
+                    setState(() {});
+                  }
+                },
+              ),
+            ],
+          ),
           content: SizedBox(
-            width: 580,
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: endpointController,
-                    decoration: const InputDecoration(labelText: "API 端点 / 代理 URL", border: OutlineInputBorder()),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: apiKeyController,
-                    decoration: const InputDecoration(labelText: "API Key (密钥)", border: OutlineInputBorder()),
-                  ),
-                  const Divider(height: 30),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            width: 720,
+            height: 480,
+            child: ListView.separated(
+              itemCount: _engines.length,
+              separatorBuilder: (_, __) => const Divider(),
+              itemBuilder: (c, idx) {
+                final eng = _engines[idx];
+                return ListTile(
+                  title: Text(eng.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text("${eng.method}  |  ${eng.urlTemplate}\n发音人数量: ${eng.voices.length}"),
+                  isThreeLine: true,
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Text("发音人列表：", style: TextStyle(fontWeight: FontWeight.bold)),
-                      ElevatedButton.icon(
-                        icon: const Icon(Icons.add, size: 16),
-                        label: const Text("新增发音人"),
+                      IconButton(
+                        icon: const Icon(Icons.edit, color: Colors.blue),
+                        tooltip: "编辑此引擎规则/修改发音人",
                         onPressed: () async {
-                          final newV = await _showAddVoiceDialog();
-                          if (newV != null) {
+                          final updated = await _showEditEngineDialog(existing: eng);
+                          if (updated != null) {
                             setDlgState(() {
-                              _currentEngine.voices.add(newV);
+                              _engines[idx] = updated;
+                              if (_currentEngine.id == eng.id) {
+                                _currentEngine = updated;
+                                _currentVoice = updated.voices.isNotEmpty ? updated.voices.first : TtsVoice(id: "", name: "无发音人");
+                              }
                             });
                             setState(() {});
                           }
                         },
                       ),
+                      IconButton(
+                        icon: const Icon(Icons.delete, color: Colors.red),
+                        tooltip: "删除引擎",
+                        onPressed: _engines.length <= 1 ? null : () {
+                          setDlgState(() {
+                            _engines.removeAt(idx);
+                            if (_currentEngine.id == eng.id) {
+                              _currentEngine = _engines.first;
+                              _currentVoice = _currentEngine.voices.first;
+                            }
+                          });
+                          setState(() {});
+                        },
+                      ),
                     ],
                   ),
-                  const SizedBox(height: 8),
-                  Container(
-                    height: 160,
-                    decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(8)),
-                    child: ListView.separated(
-                      itemCount: _currentEngine.voices.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (c, i) {
-                        final v = _currentEngine.voices[i];
-                        return ListTile(
-                          dense: true,
-                          title: Text(v.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                          subtitle: Text("ID: ${v.id}"),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
-                            onPressed: () {
-                              setDlgState(() {
-                                _currentEngine.voices.removeAt(i);
-                                if (_currentVoice.id == v.id && _currentEngine.voices.isNotEmpty) {
-                                  _currentVoice = _currentEngine.voices.first;
-                                }
-                              });
-                              setState(() {});
-                            },
-                          ),
-                        );
-                      },
-                    ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完成")),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 自由编辑/新增任何 TTS 引擎规则弹窗
+  Future<CustomTtsEngine?> _showEditEngineDialog({CustomTtsEngine? existing}) async {
+    final nameCtrl = TextEditingController(text: existing?.name ?? "我的自定义 TTS 引擎");
+    final urlCtrl = TextEditingController(text: existing?.urlTemplate ?? "https://api.your-tts.com/v1/tts");
+    final headersCtrl = TextEditingController(
+      text: existing != null ? const JsonEncoder.withIndent("  ").convert(existing.headers) : '{\n  "Authorization": "Bearer 填入密钥",\n  "Content-Type": "application/json"\n}',
+    );
+    final bodyCtrl = TextEditingController(
+      text: existing?.bodyTemplate ?? '{\n  "text": "{{text}}",\n  "voice": "{{voice}}",\n  "speed": {{speed}}\n}',
+    );
+    final jsonPathCtrl = TextEditingController(text: existing?.jsonExtractPath ?? "");
+
+    String method = existing?.method ?? "POST";
+    AudioResponseType respType = existing?.responseType ?? AudioResponseType.binaryStream;
+    List<TtsVoice> voices = List.from(existing?.voices ?? [TtsVoice(id: "default", name: "默认音色")]);
+
+    return showDialog<CustomTtsEngine>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSubState) => AlertDialog(
+          title: Text(existing == null ? "新增自定义 TTS 引擎" : "编辑引擎规则: ${existing.name}"),
+          content: SizedBox(
+            width: 680,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "引擎名称 (如: 阿里/百度/我的代理)")),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      DropdownButton<String>(
+                        value: method,
+                        items: ["POST", "GET"].map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
+                        onChanged: (v) => setSubState(() => method = v ?? "POST"),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: urlCtrl,
+                          decoration: const InputDecoration(labelText: "接口 URL (支持 {{text}}, {{voice}}, {{speed}} 占位符)"),
+                        ),
+                      ),
+                    ],
                   ),
+                  const SizedBox(height: 10),
+                  const Text("请求头 Headers (JSON 格式):", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  TextField(controller: headersCtrl, maxLines: 4, decoration: const InputDecoration(border: OutlineInputBorder())),
+                  const SizedBox(height: 10),
+                  const Text("请求体 Body 模板 (POST 时生效，支持 {{text}}, {{voice}}, {{speed}}):", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  TextField(controller: bodyCtrl, maxLines: 4, decoration: const InputDecoration(border: OutlineInputBorder())),
+                  const SizedBox(height: 10),
+                  const Text("音频响应解析方式:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  DropdownButton<AudioResponseType>(
+                    value: respType,
+                    isExpanded: true,
+                    items: const [
+                      DropdownMenuItem(value: AudioResponseType.binaryStream, child: Text("直接返回二进制音频流 (如 Fish.audio, Edge, 通用代理)")),
+                      DropdownMenuItem(value: AudioResponseType.jsonBase64, child: Text("从 JSON 中提取 Base64 音频 (如 小米 MiMo, OpenAI)")),
+                      DropdownMenuItem(value: AudioResponseType.jsonUrl, child: Text("从 JSON 中提取音频下载链接 URL")),
+                    ],
+                    onChanged: (t) => setSubState(() => respType = t ?? AudioResponseType.binaryStream),
+                  ),
+                  if (respType != AudioResponseType.binaryStream) ...[
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: jsonPathCtrl,
+                      decoration: const InputDecoration(
+                        labelText: "JSON 音频提取路径 (例如: choices[0].message.audio.data)",
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ],
+                  const Divider(height: 25),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text("发音人列表管理 (可随时添加/修改):", style: TextStyle(fontWeight: FontWeight.bold)),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.add, size: 16),
+                        label: const Text("添加发音人"),
+                        onPressed: () async {
+                          final v = await _showAddVoiceDialog();
+                          if (v != null) {
+                            setSubState(() => voices.add(v));
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Container(
+                    height: 120,
+                    decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(6)),
+                    child: ListView.builder(
+                      itemCount: voices.length,
+                      itemBuilder: (c, i) => ListTile(
+                        dense: true,
+                        title: Text(voices[i].name),
+                        subtitle: Text("ID: ${voices[i].id}"),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete, size: 16, color: Colors.red),
+                          onPressed: () => setSubState(() => voices.removeAt(i)),
+                        ),
+                      ),
+                    ),
+                  )
                 ],
               ),
             ),
           ),
           actions: [
-            TextButton(
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+            ElevatedButton(
               onPressed: () {
-                _currentEngine.apiKey = apiKeyController.text.trim();
-                _currentEngine.endpoint = endpointController.text.trim();
-                Navigator.pop(ctx);
-                setState(() {});
+                Map<String, String> parsedHeaders = {};
+                try {
+                  final decoded = jsonDecode(headersCtrl.text);
+                  if (decoded is Map) {
+                    decoded.forEach((k, v) => parsedHeaders[k.toString()] = v.toString());
+                  }
+                } catch (_) {}
+
+                final res = CustomTtsEngine(
+                  id: existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+                  name: nameCtrl.text.trim(),
+                  method: method,
+                  urlTemplate: urlCtrl.text.trim(),
+                  headers: parsedHeaders,
+                  bodyTemplate: bodyCtrl.text.trim(),
+                  responseType: respType,
+                  jsonExtractPath: jsonPathCtrl.text.trim(),
+                  voices: voices.isNotEmpty ? voices : [TtsVoice(id: "default", name: "默认音色")],
+                );
+                Navigator.pop(ctx, res);
               },
-              child: const Text("保存并关闭"),
+              child: const Text("保存引擎"),
             ),
           ],
         ),
@@ -577,9 +733,9 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "显示名称 (如: 甜美播音)")),
+            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "发音人显示名称 (如: 甜美小姐姐)")),
             const SizedBox(height: 8),
-            TextField(controller: idCtrl, decoration: const InputDecoration(labelText: "发音人 ID (如: a688f212... 或 茉莉)")),
+            TextField(controller: idCtrl, decoration: const InputDecoration(labelText: "发音人 ID (填入 API 需要的标识符)")),
           ],
         ),
         actions: [
@@ -597,20 +753,21 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
+  // ──────────────── 界面布局构建 ────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Flutter TTS 原生朗读器 (Windows 10)"),
+        title: const Text("万能 TTS 朗读器 (Windows 10 原生纯内存版)"),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
-            tooltip: "配置当前引擎密钥与发音人",
-            icon: const Icon(Icons.settings),
-            onPressed: _showEngineConfigDialog,
+            tooltip: "自定义/添加/修改 TTS 引擎规则",
+            icon: const Icon(Icons.tune),
+            onPressed: _openEngineManagerDialog,
           ),
           IconButton(
-            tooltip: "合成并导出为 MP3 文件",
+            tooltip: "批量合成导出为 MP3 文件",
             icon: const Icon(Icons.save_alt),
             onPressed: _exportAudio,
           ),
@@ -649,7 +806,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
   Widget _buildTopControlBar() {
     return Container(
-      // 关键修复 1：把之前的 pady 改为标准的 vertical
+      // 标准的 Flutter 垂直与水平内边距
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       color: Colors.grey.shade200,
       child: Wrap(
@@ -657,7 +814,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         runSpacing: 8,
         crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          DropdownButton<TtsEngine>(
+          // 引擎自由选择
+          DropdownButton<CustomTtsEngine>(
             value: _currentEngine,
             items: _engines
                 .map((e) => DropdownMenuItem(value: e, child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.bold))))
@@ -666,13 +824,15 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               if (e != null) {
                 setState(() {
                   _currentEngine = e;
-                  _currentVoice = e.voices.first;
+                  _currentVoice = e.voices.isNotEmpty ? e.voices.first : TtsVoice(id: "", name: "无发音人");
                 });
               }
             },
           ),
+
+          // 发音人选择
           DropdownButton<TtsVoice>(
-            value: _currentEngine.voices.contains(_currentVoice) ? _currentVoice : _currentEngine.voices.first,
+            value: _currentEngine.voices.contains(_currentVoice) ? _currentVoice : _currentEngine.voices.firstOrNull,
             items: _currentEngine.voices
                 .map((v) => DropdownMenuItem(value: v, child: Text(v.name)))
                 .toList(),
@@ -680,12 +840,14 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               if (v != null) setState(() => _currentVoice = v);
             },
           ),
+
+          // 语速调节
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               const Text("语速: "),
               SizedBox(
-                width: 90,
+                width: 85,
                 child: Slider(
                   value: _speed,
                   min: 0.5,
@@ -698,6 +860,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               Text("${_speed.toStringAsFixed(2)}x"),
             ],
           ),
+
+          // 码率选择
           DropdownButton<int>(
             value: _bitrate,
             items: const [
@@ -706,6 +870,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             ],
             onChanged: (b) => setState(() => _bitrate = b ?? 64),
           ),
+
+          // 控制按钮组
           ElevatedButton.icon(
             style: ElevatedButton.styleFrom(backgroundColor: _isPlaying ? Colors.grey : Colors.green, foregroundColor: Colors.white),
             icon: const Icon(Icons.play_arrow),
@@ -736,12 +902,10 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           final file = detail.files.first;
           if (file.path.endsWith('.txt') || file.path.endsWith('.md')) {
             final content = await File(file.path).readAsString();
-            setState(() {
-              _textController.text = content;
-            });
-            LogManager.instance.log("FILE", "成功拖入文件: ${file.name} (大小: ${content.length} 字符)");
+            setState(() => _textController.text = content);
+            LogManager.instance.log("FILE", "成功拖入文件: ${file.name} (共 ${content.length} 字符)");
           } else {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖拽 .txt 和 .md 格式文件！")));
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖入 .txt 和 .md 文件！")));
           }
         },
         child: Container(
@@ -755,7 +919,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(color: Colors.amber.shade100, borderRadius: BorderRadius.circular(4)),
                   child: Text(
-                    "▶ 当前正读 [${_currentSentenceIndex + 1}/${_sentences.length}]: ${_sentences[_currentSentenceIndex]}",
+                    "▶ 当前朗读 [${_currentSentenceIndex + 1}/${_sentences.length}]: ${_sentences[_currentSentenceIndex]}",
                     style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.brown),
                   ),
                 ),
@@ -767,7 +931,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   expands: true,
                   textAlignVertical: TextAlignVertical.top,
                   decoration: const InputDecoration(
-                    hintText: "【操作提示】\n1. 可直接按 Ctrl+V 粘贴任意文字\n2. 可直接从桌面上拖拽 .txt 或 .md 文档进本窗口\n3. 点击上方【开始】即可体验纯 RAM 流畅阅读",
+                    hintText: "【操作提示】\n1. 支持直接拖入 .txt / .md 小说文档\n2. 支持 Ctrl+V 随意粘贴长文本\n3. 点击右上角【⚙️ 调节图标】可自由添加任何第三方的 TTS 引擎 API！",
                     border: InputBorder.none,
                   ),
                 ),
@@ -785,9 +949,9 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text("⚙️ 朗读微调参数", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          const Text("⚙️ 朗读流水线控制", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
           const SizedBox(height: 8),
-          Text("预读数量: $_preloadCount 句 (RAM 缓冲)"),
+          Text("预读缓冲深度: $_preloadCount 句 (纯 RAM 缓存)"),
           Slider(
             value: _preloadCount.toDouble(),
             min: 1,
@@ -795,7 +959,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             divisions: 7,
             onChanged: (v) => setState(() => _preloadCount = v.toInt()),
           ),
-          Text("并发线程: $_concurrency (网络拉取)"),
+          Text("并发网络线程: $_concurrency 条"),
           Slider(
             value: _concurrency.toDouble(),
             min: 1,
@@ -803,7 +967,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             divisions: 3,
             onChanged: (v) => setState(() => _concurrency = v.toInt()),
           ),
-          Text("句子间隔停顿: ${_sentenceGapMs}ms"),
+          Text("句子停顿间隔: ${_sentenceGapMs}ms"),
           Slider(
             value: _sentenceGapMs.toDouble(),
             min: 0,
@@ -823,7 +987,6 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         child: Column(
           children: [
             Container(
-              // 关键修复 2：把之前的 pady 改为标准的 vertical
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               color: Colors.black54,
               child: Row(
