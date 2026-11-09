@@ -17,24 +17,23 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: 自适应校准工程并生成 Windows 底层
+      - name: 隔离生成 Windows 底层并编译绿色便携版
         shell: pwsh
         run: |
-          # 1. 自动容错：如果在网页端直接建在根目录的 main.dart，自动移入 lib/ 目录
+          # 1. 确保目录规范
           if (-not (Test-Path "lib")) {
               New-Item -ItemType Directory -Force -Path "lib"
           }
           if (Test-Path "main.dart") {
               Move-Item -Force "main.dart" "lib/main.dart"
-              Write-Host "已自动将根目录的 main.dart 校准至 lib/main.dart"
           }
 
-          # 2. 在临时目录生成 Windows 原生工程，仅提取 windows 文件夹，绝不触碰你的代码
+          # 2. 独立安全生成 Windows 工程模版，提取 windows 目录
           flutter create --platforms=windows temp_gen
           Copy-Item -Recurse -Force "temp_gen/windows" "windows"
           Remove-Item -Recurse -Force "temp_gen"
 
-          # 3. 安装依赖并编译 Windows 绿色便携版
+          # 3. 获取依赖并编译免安装绿色版
           flutter pub get
           flutter build windows --release
 
