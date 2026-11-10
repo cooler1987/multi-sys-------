@@ -3,98 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 
-// ─────────────────────────────────────────────────────────────
-// 1. 全动态代理管理器 (自动探测 Windows 系统代理 / 自定义 / 纯直连)
-// ─────────────────────────────────────────────────────────────
-class AppProxyManager {
-  static final AppProxyManager instance = AppProxyManager._();
-  AppProxyManager._();
-
-  String mode = "auto"; // "auto" 自动检测 | "custom" 自定义 | "direct" 纯直连
-  String customHost = "127.0.0.1";
-  int customPort = 7890;
-
-  String? _lastDetectedProxy;
-  DateTime? _lastDetectTime;
-
-  String getProxyString(Uri uri) {
-    if (mode == "direct") {
-      return "DIRECT";
-    } else if (mode == "custom") {
-      return "PROXY $customHost:$customPort; DIRECT";
-    } else {
-      final detected = detectSystemProxy();
-      return detected != null ? "PROXY $detected; DIRECT" : "DIRECT";
-    }
-  }
-
-  String? detectSystemProxy({bool forceRefresh = false}) {
-    if (!forceRefresh && _lastDetectedProxy != null && _lastDetectTime != null) {
-      if (DateTime.now().difference(_lastDetectTime!) < const Duration(seconds: 3)) {
-        return _lastDetectedProxy;
-      }
-    }
-
-    final env = Platform.environment;
-    final envProxy = env['HTTPS_PROXY'] ?? env['https_proxy'] ?? env['HTTP_PROXY'] ?? env['http_proxy'] ?? env['ALL_PROXY'];
-    if (envProxy != null && envProxy.isNotEmpty) {
-      final clean = envProxy.replaceAll(RegExp(r'^https?://'), '');
-      _lastDetectedProxy = clean;
-      _lastDetectTime = DateTime.now();
-      return clean;
-    }
-
-    if (Platform.isWindows) {
-      try {
-        final queryEnabled = Process.runSync('reg', [
-          'query',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-          '/v',
-          'ProxyEnable',
-        ]);
-        if (queryEnabled.stdout.toString().contains('0x1')) {
-          final queryServer = Process.runSync('reg', [
-            'query',
-            r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-            '/v',
-            'ProxyServer',
-          ]);
-          final out = queryServer.stdout.toString();
-          final match = RegExp(r'ProxyServer\s+REG_SZ\s+(.+)').firstMatch(out);
-          if (match != null) {
-            String server = match.group(1)!.trim();
-            if (server.contains('https=')) {
-              server = RegExp(r'https=([^;]+)').firstMatch(server)?.group(1) ?? server;
-            } else if (server.contains('=')) {
-              server = server.split('=').last;
-            }
-            _lastDetectedProxy = server;
-            _lastDetectTime = DateTime.now();
-            return server;
-          }
-        }
-      } catch (_) {}
-    }
-
-    _lastDetectedProxy = null;
-    return null;
-  }
-}
-
-class DynamicHttpOverrides extends HttpOverrides {
-  @override
-  HttpClient createHttpClient(SecurityContext? context) {
-    return super.createHttpClient(context)
-      ..findProxy = (uri) {
-        return AppProxyManager.instance.getProxyString(uri);
-      };
-  }
-}
+// 引入独立的 TTS 引擎模块
+import 'tts_engine.dart';
 
 void main() {
   HttpOverrides.global = DynamicHttpOverrides();
@@ -102,205 +16,20 @@ void main() {
   runApp(const TtsReaderApp());
 }
 
-// ─────────────────────────────────────────────────────────────
-// 2. 日志管理系统
-// ─────────────────────────────────────────────────────────────
-class LogManager {
-  static final LogManager instance = LogManager._();
-  LogManager._();
-
-  final List<String> logs = [];
-  final StreamController<List<String>> _controller = StreamController<List<String>>.broadcast();
-  Stream<List<String>> get stream => _controller.stream;
-
-  void log(String tag, String message) {
-    final now = DateTime.now().toIso8601String().substring(11, 19);
-    final entry = "[$now][$tag] $message";
-    logs.add(entry);
-    if (logs.length > 500) logs.removeAt(0);
-    _controller.add(List.from(logs));
-  }
-
-  void clear() {
-    logs.clear();
-    _controller.add([]);
-  }
-
-  Future<String?> exportLogsToFile() async {
-    if (logs.isEmpty) return null;
-    final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '保存调试日志',
-      fileName: 'tts_log_${DateTime.now().millisecondsSinceEpoch}.txt',
-      type: FileType.custom,
-      allowedExtensions: ['txt', 'log'],
-    );
-    if (savePath != null) {
-      await File(savePath).writeAsString(logs.join('\r\n'));
-      return savePath;
-    }
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// 3. 通用自定义 TTS 引擎数据结构
-// ─────────────────────────────────────────────────────────────
-enum AudioResponseType { binaryStream, jsonBase64, jsonUrl }
-
-class TtsVoice {
-  String id;
-  String name;
-  TtsVoice({required this.id, required this.name});
-
-  Map<String, dynamic> toJson() => {'id': id, 'name': name};
-  factory TtsVoice.fromJson(Map<String, dynamic> j) => TtsVoice(id: j['id'] ?? '', name: j['name'] ?? '');
-}
-
-class CustomTtsEngine {
-  String id;
-  String name;
-  String method;
-  String urlTemplate;
-  Map<String, String> headers;
-  String bodyTemplate;
-  AudioResponseType responseType;
-  String jsonExtractPath;
-  List<TtsVoice> voices;
-
-  CustomTtsEngine({
-    required this.id,
-    required this.name,
-    required this.method,
-    required this.urlTemplate,
-    required this.headers,
-    required this.bodyTemplate,
-    required this.responseType,
-    required this.jsonExtractPath,
-    required this.voices,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'method': method,
-        'urlTemplate': urlTemplate,
-        'headers': headers,
-        'bodyTemplate': bodyTemplate,
-        'responseType': responseType.index,
-        'jsonExtractPath': jsonExtractPath,
-        'voices': voices.map((v) => v.toJson()).toList(),
-      };
-
-  factory CustomTtsEngine.fromJson(Map<String, dynamic> j) => CustomTtsEngine(
-        id: j['id'] ?? DateTime.now().millisecondsSinceEpoch.toString(),
-        name: j['name'] ?? '未命名引擎',
-        method: j['method'] ?? 'POST',
-        urlTemplate: j['urlTemplate'] ?? '',
-        headers: (j['headers'] as Map<String, dynamic>?)?.map((k, v) => MapEntry(k, v.toString())) ?? {},
-        bodyTemplate: j['bodyTemplate'] ?? '',
-        responseType: AudioResponseType.values[j['responseType'] ?? 0],
-        jsonExtractPath: j['jsonExtractPath'] ?? '',
-        voices: (j['voices'] as List<dynamic>?)?.map((v) => TtsVoice.fromJson(v)).toList() ?? [TtsVoice(id: "default", name: "默认音色")],
-      );
-}
-
-// ─────────────────────────────────────────────────────────────
-// 4. 通用 TTS 执行器 (内存流控)
-// ─────────────────────────────────────────────────────────────
-class UniversalTtsExecutor {
-  static Future<Uint8List> synthesize({
-    required CustomTtsEngine engine,
-    required String text,
-    required String voiceId,
-    required double speed,
-    required int bitrate,
-  }) async {
-    LogManager.instance.log("EXEC", "调用引擎 [${engine.name}]，发音人: $voiceId，目标倍速: ${speed.toStringAsFixed(2)}x");
-
-    String replaceVars(String input, {bool isUrl = false}) {
-      final safeText = isUrl ? Uri.encodeComponent(text) : jsonEncode(text).replaceFirst(RegExp(r'^"'), '').replaceFirst(RegExp(r'"$'), '');
-      return input
-          .replaceAll('{{text}}', safeText)
-          .replaceAll('{{voice}}', voiceId)
-          .replaceAll('{{speed}}', speed.toStringAsFixed(2)) // 真实动态替换语速
-          .replaceAll('{{bitrate}}', bitrate.toString());
-    }
-
-    final targetUrl = Uri.parse(replaceVars(engine.urlTemplate, isUrl: true));
-    final processedHeaders = <String, String>{};
-    engine.headers.forEach((k, v) => processedHeaders[k] = replaceVars(v));
-
-    http.Response res;
-    try {
-      if (engine.method.toUpperCase() == 'POST') {
-        res = await http.post(targetUrl, headers: processedHeaders, body: replaceVars(engine.bodyTemplate)).timeout(const Duration(seconds: 35));
-      } else {
-        res = await http.get(targetUrl, headers: processedHeaders).timeout(const Duration(seconds: 35));
-      }
-    } catch (e) {
-      throw Exception("网络连接超时或断开 ($e)。\n提示：若访问海外直连，请检查顶部【🌐 代理设置】！");
-    }
-
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      final errBody = utf8.decode(res.bodyBytes, allowMalformed: true);
-      throw Exception("HTTP ${res.statusCode}: $errBody");
-    }
-
-    switch (engine.responseType) {
-      case AudioResponseType.binaryStream:
-        if (res.bodyBytes.isEmpty) throw Exception("接口返回空数据");
-        LogManager.instance.log("RAM", "二进制流已进入内存 (${(res.bodyBytes.lengthInBytes / 1024).toStringAsFixed(1)} KB)");
-        return res.bodyBytes;
-
-      case AudioResponseType.jsonBase64:
-        final jsonObj = jsonDecode(utf8.decode(res.bodyBytes));
-        final b64 = _extractByPath(jsonObj, engine.jsonExtractPath);
-        if (b64 == null || b64 is! String || b64.isEmpty) {
-          throw Exception("无法从 JSON 路径 [${engine.jsonExtractPath}] 提取 Base64 音频");
-        }
-        return base64Decode(b64.replaceAll(RegExp(r'\s+'), ''));
-
-      case AudioResponseType.jsonUrl:
-        final jsonObj = jsonDecode(utf8.decode(res.bodyBytes));
-        final audioUrl = _extractByPath(jsonObj, engine.jsonExtractPath);
-        if (audioUrl == null || audioUrl is! String || audioUrl.isEmpty) {
-          throw Exception("无法从 JSON 提取音频下载 URL");
-        }
-        final dl = await http.get(Uri.parse(audioUrl));
-        return dl.bodyBytes;
-    }
-  }
-
-  static dynamic _extractByPath(dynamic root, String path) {
-    if (path.trim().isEmpty) return root;
-    dynamic current = root;
-    for (var seg in path.split('.')) {
-      if (seg.contains('[') && seg.endsWith(']')) {
-        final key = seg.substring(0, seg.indexOf('['));
-        final idx = int.tryParse(seg.substring(seg.indexOf('[') + 1, seg.length - 1)) ?? 0;
-        if (key.isNotEmpty) current = current[key];
-        current = current[idx];
-      } else {
-        current = current[seg];
-      }
-      if (current == null) return null;
-    }
-    return current;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// 5. 主程序与 UI 交互
-// ─────────────────────────────────────────────────────────────
 class TtsReaderApp extends StatelessWidget {
   const TtsReaderApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '万能 TTS 朗读与发音人评测工具 (真正物理倍速版)',
+      title: '万能 TTS 朗读与发音人评测工具',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF5E35B1),
+          brightness: Brightness.light,
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF7F8FA),
         useMaterial3: true,
       ),
       home: const ReaderHomePage(),
@@ -315,11 +44,12 @@ class ReaderHomePage extends StatefulWidget {
   State<ReaderHomePage> createState() => _ReaderHomePageState();
 }
 
-class _ReaderHomePageState extends State<ReaderHomePage> {
+class _ReaderHomePageState extends State<ReaderHomePage> with SingleTickerProviderStateMixin {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _logScrollController = ScrollController();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
+  late TabController _tabController;
   late List<CustomTtsEngine> _engines;
   late CustomTtsEngine _currentEngine;
   late TtsVoice _currentVoice;
@@ -328,7 +58,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   int _bitrate = 64;
   int _preloadCount = 4;
   int _concurrency = 2;
-  int _sentenceGapMs = 250;
+  int _sentenceGapMs = 200;
 
   List<String> _sentences = [];
   int _currentSentenceIndex = -1;
@@ -342,6 +72,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 3, vsync: this);
     _loadConfig();
     _initAudioPlayer();
   }
@@ -357,7 +88,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         _bitrate = data['bitrate'] ?? 64;
         _preloadCount = data['preloadCount'] ?? 4;
         _concurrency = data['concurrency'] ?? 2;
-        _sentenceGapMs = data['sentenceGapMs'] ?? 250;
+        _sentenceGapMs = data['sentenceGapMs'] ?? 200;
 
         AppProxyManager.instance.mode = data['proxyMode'] ?? "auto";
         AppProxyManager.instance.customHost = data['proxyHost'] ?? "127.0.0.1";
@@ -368,14 +99,16 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           _engines = list;
           _currentEngine = _engines.first;
           _currentVoice = _currentEngine.voices.isNotEmpty ? _currentEngine.voices.first : TtsVoice(id: '', name: '默认');
-          LogManager.instance.log("CONFIG", "已自动加载本地持久化设置 tts_config.json");
+          LogManager.instance.log("CONFIG", "已自动恢复本地持久化配置");
           return;
         }
       }
     } catch (e) {
-      LogManager.instance.log("CONFIG-ERR", "加载本地配置失败: $e，启用内置预设");
+      LogManager.instance.log("CONFIG-ERR", "加载本地配置失败: $e，初始化默认引擎库");
     }
-    _initDefaultEngines();
+    _engines = DefaultEnginePresets.get();
+    _currentEngine = _engines.first;
+    _currentVoice = _currentEngine.voices.first;
   }
 
   void _saveConfig() {
@@ -392,191 +125,20 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         'engines': _engines.map((e) => e.toJson()).toList(),
       };
       _localConfigFile.writeAsStringSync(const JsonEncoder.withIndent("  ").convert(data));
-      LogManager.instance.log("CONFIG", "配置已保存至本地 tts_config.json");
+      LogManager.instance.log("CONFIG", "配置已成功保存至本地 tts_config.json");
     } catch (e) {
       LogManager.instance.log("CONFIG-ERR", "自动保存失败: $e");
     }
   }
 
-  void _initDefaultEngines() {
-    _engines = [
-      CustomTtsEngine(
-        id: "cf_worker_template",
-        name: "Cloudflare 中转引擎 (国内直连)",
-        method: "GET",
-        // 关键修复：URL 动态透传 speed
-        urlTemplate: "https://tts.yzwww.ggff.net/tts?token=你的访问密码&text={{text}}&voice={{voice}}&speed={{speed}}&bitrate={{bitrate}}",
-        headers: {},
-        bodyTemplate: "",
-        responseType: AudioResponseType.binaryStream,
-        jsonExtractPath: "",
-        voices: [
-          TtsVoice(id: "a688f2129bea41d1ae6042462892ecf8", name: "通用小说男声"),
-          TtsVoice(id: "cf71d823861b4e0eadff1672d646da36", name: "几何知性女声"),
-        ],
-      ),
-      CustomTtsEngine(
-        id: "fish_audio_official",
-        name: "Fish.Audio 官方直连 (需填Key)",
-        method: "POST",
-        urlTemplate: "https://api.fish.audio/v1/tts",
-        headers: {
-          "Authorization": "Bearer 填入你的FishAudio密钥",
-          "Content-Type": "application/json",
-          "model": "s2.1-pro-free"
-        },
-        // 关键修复：将硬编码的 1.75 彻底替换为动态占位符 {{speed}}
-        bodyTemplate: jsonEncode({
-          "text": "{{text}}",
-          "reference_id": "{{voice}}",
-          "format": "mp3",
-          "mp3_bitrate": 64,
-          "chunk_length": 100,
-          "latency": "balanced",
-          "prosody": {"speed": "{{speed}}"}
-        }).replaceAll('"{{speed}}"', '{{speed}}'), // 输出为数字而非字符串
-        responseType: AudioResponseType.binaryStream,
-        jsonExtractPath: "",
-        voices: [
-          TtsVoice(id: "a688f2129bea41d1ae6042462892ecf8", name: "通用男声"),
-        ],
-      ),
-      CustomTtsEngine(
-        id: "mimo_official",
-        name: "小米 MiMo-TTS (需填Key)",
-        method: "POST",
-        urlTemplate: "https://api.xiaomimimo.com/v1/chat/completions",
-        headers: {
-          "Authorization": "Bearer 填入你的MIMO密钥",
-          "Content-Type": "application/json"
-        },
-        bodyTemplate: jsonEncode({
-          "model": "mimo-v2.5-tts",
-          "messages": [
-            {"role": "user", "content": "请以约 {{speed}} 倍速快节奏朗读，声音清晰自然"},
-            {"role": "assistant", "content": "{{text}}"}
-          ],
-          "audio": {"voice": "{{voice}}", "format": "mp3"}
-        }),
-        responseType: AudioResponseType.jsonBase64,
-        jsonExtractPath: "choices[0].message.audio.data",
-        voices: [
-          TtsVoice(id: "茉莉", name: "茉莉 (知性成熟)"),
-          TtsVoice(id: "冰糖", name: "冰糖 (清甜少女)"),
-          TtsVoice(id: "苏打", name: "苏打 (活力青年)"),
-          TtsVoice(id: "白桦", name: "白桦 (磁性低沉)"),
-        ],
-      ),
-    ];
-    _currentEngine = _engines.first;
-    _currentVoice = _currentEngine.voices.first;
-  }
-
-  // ──────────────── 全局网络代理配置弹窗 ────────────────
-  void _openProxySettingsDialog() {
-    final hostCtrl = TextEditingController(text: AppProxyManager.instance.customHost);
-    final portCtrl = TextEditingController(text: AppProxyManager.instance.customPort.toString());
-    String currentMode = AppProxyManager.instance.mode;
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlgState) {
-          final detected = AppProxyManager.instance.detectSystemProxy(forceRefresh: true);
-
-          return AlertDialog(
-            title: const Row(
-              children: [
-                Icon(Icons.lan, color: Colors.deepPurple),
-                SizedBox(width: 8),
-                Text("全局网络与代理配置", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            content: SizedBox(
-              width: 500,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text("选择软件请求海外 API 时采用的网络路由模式：", style: TextStyle(fontSize: 12, color: Colors.grey)),
-                  const SizedBox(height: 12),
-                  RadioListTile<String>(
-                    value: "auto",
-                    groupValue: currentMode,
-                    title: const Text("🟢 自动检测系统代理 (自适应任意软件端口)", style: TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: Text(
-                      detected != null ? "已自动嗅探到当前 Windows 生效代理：$detected" : "未检测到系统代理（若开启了代理软件，请确认开启【系统代理】开关）",
-                      style: TextStyle(color: detected != null ? Colors.green.shade700 : Colors.orange.shade800, fontSize: 11),
-                    ),
-                    onChanged: (v) => setDlgState(() => currentMode = v!),
-                  ),
-                  RadioListTile<String>(
-                    value: "custom",
-                    groupValue: currentMode,
-                    title: const Text("🟡 自定义代理端口 (完全自主掌控)", style: TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: const Text("自由输入 IP 与端口 (支持 Clash 7890、v2rayN 10809、SS 1080 等)", style: TextStyle(fontSize: 11)),
-                    onChanged: (v) => setDlgState(() => currentMode = v!),
-                  ),
-                  if (currentMode == "custom")
-                    Padding(
-                      padding: const EdgeInsets.only(left: 28, right: 16, top: 6, bottom: 6),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            flex: 3,
-                            child: TextField(controller: hostCtrl, decoration: const InputDecoration(labelText: "代理 IP", isDense: true, border: OutlineInputBorder())),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            flex: 2,
-                            child: TextField(controller: portCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "端口", isDense: true, border: OutlineInputBorder())),
-                          ),
-                        ],
-                      ),
-                    ),
-                  RadioListTile<String>(
-                    value: "direct",
-                    groupValue: currentMode,
-                    title: const Text("🔴 纯直连模式 (不使用代理)", style: TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: const Text("适合已开启 TUN 虚拟网卡，或使用 Cloudflare 中转域名的用户", style: TextStyle(fontSize: 11)),
-                    onChanged: (v) => setDlgState(() => currentMode = v!),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
-              ElevatedButton(
-                onPressed: () {
-                  AppProxyManager.instance.mode = currentMode;
-                  AppProxyManager.instance.customHost = hostCtrl.text.trim();
-                  AppProxyManager.instance.customPort = int.tryParse(portCtrl.text.trim()) ?? 7890;
-                  _saveConfig();
-                  Navigator.pop(ctx);
-                  LogManager.instance.log("PROXY", "代理已切换为: $currentMode (${AppProxyManager.instance.getProxyString(Uri())})");
-                },
-                child: const Text("保存并立即生效"),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  // ──────────────── 音频解码播放 (核心修复：物理倍速注入) ────────────────
+  // ──────────────── 音频解码与物理倍速 ────────────────
   Future<void> _playAudioFromRam(Uint8List bytes) async {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.setVolume(1.0);
-      
-      // 关键修复 1：在启动音频前，将播放器底层倍速强制同步为设定语速
       await _audioPlayer.setPlaybackRate(_speed);
       await _audioPlayer.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
-      // 关键修复 2：Windows Media Foundation 加载数据后，再次锚定倍速，确保 100% 硬件变速
-      await _audioPlayer.setPlaybackRate(_speed);
-      
-      LogManager.instance.log("AUDIO", "扬声器正在以真实 [${_speed.toStringAsFixed(2)}x] 语速物理播放音频");
+      await _audioPlayer.setPlaybackRate(_speed); // 保证 Windows 硬件级强制变速
     } catch (e) {
       final dataUri = Uri.dataFromBytes(bytes, mimeType: 'audio/mpeg').toString();
       await _audioPlayer.setPlaybackRate(_speed);
@@ -602,21 +164,25 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _audioPlayer.dispose();
     _textController.dispose();
     _logScrollController.dispose();
     super.dispose();
   }
 
-  // ──────────────── 发音人试听 ────────────────
+  // ──────────────── 发音人即时试听 ────────────────
   Future<void> _previewVoice(CustomTtsEngine engine, TtsVoice voice) async {
     LogManager.instance.log("PREVIEW", "正在以 [${_speed.toStringAsFixed(2)}x] 倍速试听发音人: [${voice.name}]...");
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("正在生成 [${voice.name}] 的试听音频..."), duration: const Duration(seconds: 2)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text("正在生成 [${voice.name}] 的试听音频..."),
+      duration: const Duration(seconds: 2),
+    ));
 
     try {
       final bytes = await UniversalTtsExecutor.synthesize(
         engine: engine,
-        text: "你好，这是一条试听语音。正在验证发音人：${voice.name} 在当前倍速下的发音效果。",
+        text: "你好，这是一条试听语音。正在验证发音人：${voice.name} 的朗读效果。",
         voiceId: voice.id,
         speed: _speed,
         bitrate: _bitrate,
@@ -629,7 +195,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text("❌ 试听失败"),
-            content: Text("错误原因：\n$e\n\n排查建议：\n1. 海外官方直连请检查顶部【🌐】代理设置；\n2. 检查 API Key 或密码。"),
+            content: Text("错误信息：\n$e"),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("好"))],
           ),
         );
@@ -661,11 +227,11 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
             title: const Text("🎉 连通性测试成功！"),
             content: Text(
               "• 引擎名称: ${engine.name}\n"
-              "• 网络往返耗时: ${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)} 秒\n"
-              "• 音频体积: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB\n"
-              "• 播放倍速: ${_speed.toStringAsFixed(2)}x\n"
-              "• 当前代理状态: ${AppProxyManager.instance.getProxyString(Uri())}\n\n"
-              "扬声器已播放试听音频，能听到声音且倍速明显加快说明一切正常！",
+              "• 往返耗时: ${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)} 秒\n"
+              "• 音频大小: ${(bytes.lengthInBytes / 1024).toStringAsFixed(1)} KB\n"
+              "• 生效倍速: ${_speed.toStringAsFixed(2)}x\n"
+              "• 代理状态: ${AppProxyManager.instance.getProxyString(Uri())}\n\n"
+              "扬声器已播放试听音频，能听到声音说明整条链路完全通畅！",
             ),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("确定"))],
           ),
@@ -679,7 +245,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text("❌ 连通性测试失败"),
-            content: Text("错误详情：\n$e\n\n排查指南：\n• 如果提示超时，请点击顶栏【🌐】切换代理端口或自动检测；\n• 如果提示 401，请检查密钥是否填写正确。"),
+            content: Text("错误原因：\n$e"),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("知道了"))],
           ),
         );
@@ -687,7 +253,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     }
   }
 
-  // ──────────────── 朗读管线 ────────────────
+  // ──────────────── 朗读流程 ────────────────
   void _splitSentences() {
     final text = _textController.text;
     if (text.trim().isEmpty) {
@@ -700,7 +266,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         .map((m) => m.group(0)!.trim())
         .where((s) => s.isNotEmpty && RegExp(r'[\w\u4e00-\u9fa5]').hasMatch(s))
         .toList();
-    LogManager.instance.log("TEXT", "文本已切分为 ${_sentences.length} 句");
+    LogManager.instance.log("TEXT", "正文已切分为 ${_sentences.length} 个独立句子");
   }
 
   void _schedulePreload(int currentIndex, int sessionId) {
@@ -752,7 +318,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             backgroundColor: Colors.red,
-            content: Text("朗读中断：未能获取到音频。请点击右上角【🌐】检查代理或查看日志！"),
+            content: Text("朗读中断：未能获取到音频。请检查引擎配置或查看日志！"),
           ));
         }
         return;
@@ -832,14 +398,97 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
         );
         exportBytes.add(b);
       } catch (e) {
-        LogManager.instance.log("EXPORT-ERR", "第 ${i + 1} 句失败: $e");
+        LogManager.instance.log("EXPORT-ERR", "第 ${i + 1} 句导出失败: $e");
       }
     }
     await File(savePath).writeAsBytes(exportBytes.toBytes());
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("音频已成功导出至：$savePath")));
   }
 
-  // ──────────────── 引擎管理弹窗 ────────────────
+  // ──────────────── 全局网络代理弹窗 ────────────────
+  void _openProxySettingsDialog() {
+    final hostCtrl = TextEditingController(text: AppProxyManager.instance.customHost);
+    final portCtrl = TextEditingController(text: AppProxyManager.instance.customPort.toString());
+    String currentMode = AppProxyManager.instance.mode;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          final detected = AppProxyManager.instance.detectSystemProxy(forceRefresh: true);
+          return AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.lan, color: Color(0xFF5E35B1)),
+                SizedBox(width: 8),
+                Text("全局网络与代理配置", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            content: SizedBox(
+              width: 500,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  RadioListTile<String>(
+                    value: "auto",
+                    groupValue: currentMode,
+                    title: const Text("🟢 自动检测系统代理 (推荐)", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text(
+                      detected != null ? "自动嗅探到 Windows 生效代理: $detected" : "未检测到系统代理（若开了代理软件请确认开启【系统代理】）",
+                      style: TextStyle(color: detected != null ? Colors.green.shade700 : Colors.orange.shade800, fontSize: 11),
+                    ),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                  RadioListTile<String>(
+                    value: "custom",
+                    groupValue: currentMode,
+                    title: const Text("🟡 自定义代理端口", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: const Text("支持 Clash 7890、v2rayN 10809、SS 1080 等任意端口", style: TextStyle(fontSize: 11)),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                  if (currentMode == "custom")
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 6),
+                      child: Row(
+                        children: [
+                          Expanded(flex: 3, child: TextField(controller: hostCtrl, decoration: const InputDecoration(labelText: "代理 IP", isDense: true, border: OutlineInputBorder()))),
+                          const SizedBox(width: 8),
+                          Expanded(flex: 2, child: TextField(controller: portCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "端口", isDense: true, border: OutlineInputBorder()))),
+                        ],
+                      ),
+                    ),
+                  RadioListTile<String>(
+                    value: "direct",
+                    groupValue: currentMode,
+                    title: const Text("🔴 纯直连模式", style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: const Text("国内网络裸连（适合 Cloudflare 中转域名或已开启 TUN 网卡）", style: TextStyle(fontSize: 11)),
+                    onChanged: (v) => setDlgState(() => currentMode = v!),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+              ElevatedButton(
+                onPressed: () {
+                  AppProxyManager.instance.mode = currentMode;
+                  AppProxyManager.instance.customHost = hostCtrl.text.trim();
+                  AppProxyManager.instance.customPort = int.tryParse(portCtrl.text.trim()) ?? 7890;
+                  _saveConfig();
+                  Navigator.pop(ctx);
+                  LogManager.instance.log("PROXY", "代理切换为: $currentMode (${AppProxyManager.instance.getProxyString(Uri())})");
+                },
+                child: const Text("保存生效"),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  // ──────────────── 引擎规则配置弹窗 ────────────────
   void _openEngineManagerDialog() {
     showDialog(
       context: context,
@@ -851,7 +500,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               const Text("⚙️ TTS 引擎管理与自由定义", style: TextStyle(fontWeight: FontWeight.bold)),
               ElevatedButton.icon(
                 icon: const Icon(Icons.add, size: 16),
-                label: const Text("新增引擎"),
+                label: const Text("新增自定义引擎"),
                 onPressed: () async {
                   final newEngine = await _showEditEngineDialog();
                   if (newEngine != null) {
@@ -884,7 +533,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.network_check, color: Colors.teal),
-                        tooltip: "测试该引擎连通性与倍速发声",
+                        tooltip: "连通性测试与试听",
                         onPressed: () => _testEngineConnectivity(eng),
                       ),
                       IconButton(
@@ -920,7 +569,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
               },
             ),
           ),
-          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("关闭"))],
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完成"))],
         ),
       ),
     );
@@ -985,10 +634,11 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                       DropdownMenuItem(value: AudioResponseType.binaryStream, child: Text("直接返回二进制音频流 (如 Fish.audio, Edge, 通用中转代理)")),
                       DropdownMenuItem(value: AudioResponseType.jsonBase64, child: Text("从 JSON 中提取 Base64 音频 (如 小米 MiMo, OpenAI)")),
                       DropdownMenuItem(value: AudioResponseType.jsonUrl, child: Text("从 JSON 中提取音频下载链接 URL")),
+                      DropdownMenuItem(value: AudioResponseType.namiAi, child: Text("纳米AI 专用协议 (带时间戳、动态签名、MID 校验)")),
                     ],
                     onChanged: (t) => setSubState(() => respType = t ?? AudioResponseType.binaryStream),
                   ),
-                  if (respType != AudioResponseType.binaryStream) ...[
+                  if (respType == AudioResponseType.jsonBase64 || respType == AudioResponseType.jsonUrl) ...[
                     const SizedBox(height: 8),
                     TextField(controller: jsonPathCtrl, decoration: const InputDecoration(labelText: "JSON 音频提取路径", border: OutlineInputBorder())),
                   ],
@@ -996,7 +646,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text("发音人列表 (支持试听与管理):", style: TextStyle(fontWeight: FontWeight.bold)),
+                      const Text("发音人列表:", style: TextStyle(fontWeight: FontWeight.bold)),
                       ElevatedButton.icon(
                         icon: const Icon(Icons.add, size: 16),
                         label: const Text("添加发音人"),
@@ -1094,46 +744,55 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("万能 TTS 朗读与发音人评测工具 (纯内存版)"),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: Row(
+          children: [
+            const Icon(Icons.record_voice_over, color: Color(0xFF5E35B1)),
+            const SizedBox(width: 10),
+            const Text("TTS 小说朗读工具", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+            const SizedBox(width: 12),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(color: const Color(0xFFEDE7F6), borderRadius: BorderRadius.circular(12)),
+              child: Text("当前引擎: ${_currentEngine.name}", style: const TextStyle(fontSize: 12, color: Color(0xFF5E35B1), fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+        backgroundColor: Colors.white,
+        elevation: 0.5,
         actions: [
           IconButton(
-            tooltip: "全局网络与代理配置 (自动检测/自定义端口)",
-            icon: const Icon(Icons.lan, color: Colors.indigo),
+            tooltip: "全局网络与代理配置",
+            icon: const Icon(Icons.lan, color: Color(0xFF5E35B1)),
             onPressed: _openProxySettingsDialog,
           ),
           IconButton(
-            tooltip: "自定义/添加/修改 TTS 引擎规则",
-            icon: const Icon(Icons.tune),
+            tooltip: "自定义 TTS 引擎库",
+            icon: const Icon(Icons.tune, color: Color(0xFF5E35B1)),
             onPressed: _openEngineManagerDialog,
           ),
           IconButton(
-            tooltip: "批量合成导出为 MP3 文件",
-            icon: const Icon(Icons.save_alt),
+            tooltip: "批量合成导出 MP3",
+            icon: const Icon(Icons.save_alt, color: Color(0xFF5E35B1)),
             onPressed: _exportAudio,
           ),
           const SizedBox(width: 8),
         ],
       ),
-      body: Row(
+      body: Column(
         children: [
+          _buildModernTopBar(),
           Expanded(
-            flex: 6,
-            child: Column(
+            child: Row(
               children: [
-                _buildTopControlBar(),
-                _buildDragAndDropTextArea(),
-              ],
-            ),
-          ),
-          Container(
-            width: 320,
-            decoration: BoxDecoration(color: Colors.grey.shade100, border: Border(left: BorderSide(color: Colors.grey.shade300))),
-            child: Column(
-              children: [
-                _buildSidebarSettings(),
-                const Divider(height: 1),
-                _buildLiveLogConsole(),
+                Expanded(flex: 7, child: _buildReadingCanvas()),
+                Container(
+                  width: 340,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    border: Border(left: BorderSide(color: Colors.grey.shade200)),
+                  ),
+                  child: _buildRightTabbedConsole(),
+                ),
               ],
             ),
           ),
@@ -1142,52 +801,69 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  Widget _buildTopControlBar() {
+  // 现代轻量化顶部播控栏
+  Widget _buildModernTopBar() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      color: Colors.grey.shade200,
-      child: Wrap(
-        spacing: 12,
-        runSpacing: 8,
-        crossAxisAlignment: WrapCrossAlignment.center,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+      ),
+      child: Row(
         children: [
-          DropdownButton<CustomTtsEngine>(
-            value: _currentEngine,
-            items: _engines.map((e) => DropdownMenuItem(value: e, child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.bold)))).toList(),
-            onChanged: (e) {
-              if (e != null) {
-                setState(() {
-                  _currentEngine = e;
-                  _currentVoice = e.voices.isNotEmpty ? e.voices.first : TtsVoice(id: "", name: "无");
-                });
-                _saveConfig();
-              }
-            },
+          // 引擎下拉
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(8)),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<CustomTtsEngine>(
+                value: _currentEngine,
+                items: _engines.map((e) => DropdownMenuItem(value: e, child: Text(e.name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)))).toList(),
+                onChanged: (e) {
+                  if (e != null) {
+                    setState(() {
+                      _currentEngine = e;
+                      _currentVoice = e.voices.isNotEmpty ? e.voices.first : TtsVoice(id: "", name: "无");
+                    });
+                    _saveConfig();
+                  }
+                },
+              ),
+            ),
           ),
-          DropdownButton<TtsVoice>(
-            value: _currentEngine.voices.contains(_currentVoice) ? _currentVoice : _currentEngine.voices.firstOrNull,
-            items: _currentEngine.voices.map((v) => DropdownMenuItem(value: v, child: Text(v.name))).toList(),
-            onChanged: (v) {
-              if (v != null) {
-                setState(() => _currentVoice = v);
-                _saveConfig();
-              }
-            },
+          const SizedBox(width: 8),
+          // 发音人下拉
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(8)),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<TtsVoice>(
+                value: _currentEngine.voices.contains(_currentVoice) ? _currentVoice : _currentEngine.voices.firstOrNull,
+                items: _currentEngine.voices.map((v) => DropdownMenuItem(value: v, child: Text(v.name, style: const TextStyle(fontSize: 13)))).toList(),
+                onChanged: (v) {
+                  if (v != null) {
+                    setState(() => _currentVoice = v);
+                    _saveConfig();
+                  }
+                },
+              ),
+            ),
           ),
-          // 发音人试听按钮
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple, foregroundColor: Colors.white),
-            icon: const Icon(Icons.volume_up, size: 16),
-            label: const Text("试听"),
+          const SizedBox(width: 6),
+          // 试听
+          IconButton(
+            icon: const Icon(Icons.volume_up, color: Color(0xFF5E35B1)),
+            tooltip: "试听当前发音人",
             onPressed: () => _previewVoice(_currentEngine, _currentVoice),
           ),
-          // 关键修复：滑块拖动实时动态生效，边拖边变速
+          const VerticalDivider(width: 24, thickness: 1, indent: 8, endIndent: 8),
+
+          // 物理倍速滑动器 (支持边播边拉)
           Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
-              const Text("语速: "),
+              const Text("语速:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
               SizedBox(
-                width: 80,
+                width: 100,
                 child: Slider(
                   value: _speed,
                   min: 0.5,
@@ -1196,38 +872,45 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
                   label: "${_speed}x",
                   onChanged: (val) {
                     setState(() => _speed = val);
-                    // 核心：直接向播放器发送实时变速指令
                     _audioPlayer.setPlaybackRate(val);
                     _saveConfig();
                   },
                 ),
               ),
-              Text("${_speed.toStringAsFixed(2)}x"),
+              Text("${_speed.toStringAsFixed(2)}x", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF5E35B1))),
             ],
           ),
+          const SizedBox(width: 10),
+
+          // 码率
           DropdownButton<int>(
             value: _bitrate,
-            items: const [DropdownMenuItem(value: 64, child: Text("省流 64k")), DropdownMenuItem(value: 128, child: Text("高清 128k"))],
+            underline: const SizedBox(),
+            items: const [DropdownMenuItem(value: 64, child: Text("64k", style: TextStyle(fontSize: 12))), DropdownMenuItem(value: 128, child: Text("128k", style: TextStyle(fontSize: 12)))],
             onChanged: (b) {
               setState(() => _bitrate = b ?? 64);
               _saveConfig();
             },
           ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: _isPlaying ? Colors.grey : Colors.green, foregroundColor: Colors.white),
-            icon: const Icon(Icons.play_arrow),
+          const Spacer(),
+
+          // 播控按钮组
+          FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: _isPlaying ? Colors.grey : const Color(0xFF2E7D32)),
+            icon: const Icon(Icons.play_arrow, size: 18),
             label: const Text("开始"),
             onPressed: _isPlaying ? null : _startPlayback,
           ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange, foregroundColor: Colors.white),
-            icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
+          const SizedBox(width: 6),
+          FilledButton.tonalIcon(
+            icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause, size: 18),
             label: Text(_isPaused ? "继续" : "暂停"),
             onPressed: _isPlaying ? _togglePause : null,
           ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
-            icon: const Icon(Icons.stop),
+          const SizedBox(width: 6),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFC62828)),
+            icon: const Icon(Icons.stop, size: 18),
             label: const Text("停止"),
             onPressed: _isPlaying ? () => _stopPlayback("手动停止") : null,
           ),
@@ -1236,93 +919,167 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  Widget _buildDragAndDropTextArea() {
-    return Expanded(
-      child: DropTarget(
-        onDragDone: (detail) async {
-          final file = detail.files.first;
-          if (file.path.endsWith('.txt') || file.path.endsWith('.md')) {
-            final content = await File(file.path).readAsString();
-            setState(() => _textController.text = content);
-            LogManager.instance.log("FILE", "成功拖入文档: ${file.name} (大小: ${content.length} 字符)");
-          } else {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖入 .txt 和 .md 格式文件！")));
-          }
-        },
-        child: Container(
-          color: Colors.white,
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            children: [
-              if (_sentences.isNotEmpty && _currentSentenceIndex >= 0)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(color: Colors.amber.shade100, borderRadius: BorderRadius.circular(4)),
-                  child: Text(
-                    "▶ 当前正读 [${_currentSentenceIndex + 1}/${_sentences.length}]: ${_sentences[_currentSentenceIndex]}",
-                    style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.brown),
-                  ),
+  // 类纸质阅读体验主视窗
+  Widget _buildReadingCanvas() {
+    return DropTarget(
+      onDragDone: (detail) async {
+        final file = detail.files.first;
+        if (file.path.endsWith('.txt') || file.path.endsWith('.md')) {
+          final content = await File(file.path).readAsString();
+          setState(() => _textController.text = content);
+          LogManager.instance.log("FILE", "成功拖入文件: ${file.name} (大小: ${content.length} 字符)");
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("仅支持拖入 .txt 和 .md 格式文件！")));
+        }
+      },
+      child: Container(
+        color: const Color(0xFFF9F9F8),
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            // 正读句子进度条高亮卡片
+            if (_sentences.isNotEmpty && _currentSentenceIndex >= 0)
+              Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFF8E1),
+                  border: Border.all(color: const Color(0xFFFFE082)),
+                  borderRadius: BorderRadius.circular(8),
                 ),
-              const SizedBox(height: 6),
-              Expanded(
+                child: Row(
+                  children: [
+                    const Icon(Icons.volume_up, color: Color(0xFFE65100), size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        "正在朗读 [${_currentSentenceIndex + 1}/${_sentences.length}]: ${_sentences[_currentSentenceIndex]}",
+                        style: const TextStyle(color: Color(0xFF4E342E), fontWeight: FontWeight.bold, fontSize: 13),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            // 主文本编辑阅读区域
+            Expanded(
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(10),
+                  boxShadow: [
+                    BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 6, offset: const Offset(0, 2))
+                  ],
+                ),
+                padding: const EdgeInsets.all(16),
                 child: TextField(
                   controller: _textController,
                   maxLines: null,
                   expands: true,
                   textAlignVertical: TextAlignVertical.top,
+                  style: const TextStyle(fontSize: 15, height: 1.6, color: Color(0xFF263238)),
                   decoration: const InputDecoration(
-                    hintText: "【快捷提示】\n1. 支持直接拖入 .txt/.md 小说或 Ctrl+V 粘贴文本\n2. 语速滑块支持在播放中【边播边拉】，实时变速不变调\n3. 点击发音人右侧【试听】直接发声验证\n4. 点击右上角【🌐】可一键切换代理模式",
+                    hintText: "【阅读指引】\n• 直接在此处粘贴任意文本，或将 .txt / .md 小说文件拖入本窗口\n• 默认已内置免密的 [纳米AI] 与 [Cloudflare 中转]，开箱即用\n• 点击顶部【开始】启动朗读，支持在阅读中直接拖动【语速】实时物理变速",
                     border: InputBorder.none,
                   ),
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Widget _buildSidebarSettings() {
+  // 右侧现代化三标签控制台
+  Widget _buildRightTabbedConsole() {
+    return Column(
+      children: [
+        TabBar(
+          controller: _tabController,
+          labelColor: const Color(0xFF5E35B1),
+          unselectedLabelColor: Colors.grey,
+          indicatorColor: const Color(0xFF5E35B1),
+          tabs: const [
+            Tab(text: "流水线调优"),
+            Tab(text: "实时日志"),
+            Tab(text: "网络状态"),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              _buildPipelineSettingsTab(),
+              _buildLiveLogTab(),
+              _buildNetworkStatusTab(),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPipelineSettingsTab() {
     return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      padding: const EdgeInsets.all(16),
+      child: ListView(
         children: [
-          const Text("⚙️ 朗读流水线控制", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-          const SizedBox(height: 8),
-          Text("预读缓冲深度: $_preloadCount 句 (纯 RAM 缓冲)"),
+          const Text("预读深度 (RAM 内存缓冲)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
           Slider(
             value: _preloadCount.toDouble(),
             min: 1,
             max: 8,
             divisions: 7,
+            label: "$_preloadCount 句",
             onChanged: (v) {
               setState(() => _preloadCount = v.toInt());
               _saveConfig();
             },
           ),
-          Text("并发网络线程: $_concurrency 条"),
+          const SizedBox(height: 8),
+          const Text("网络并发拉取线程数", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
           Slider(
             value: _concurrency.toDouble(),
             min: 1,
             max: 4,
             divisions: 3,
+            label: "$_concurrency 条",
             onChanged: (v) {
               setState(() => _concurrency = v.toInt());
               _saveConfig();
             },
           ),
-          Text("句子停顿间隔: ${_sentenceGapMs}ms"),
+          const SizedBox(height: 8),
+          const Text("句子间停顿时间", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
           Slider(
             value: _sentenceGapMs.toDouble(),
             min: 0,
             max: 1000,
             divisions: 10,
+            label: "${_sentenceGapMs}ms",
             onChanged: (v) {
               setState(() => _sentenceGapMs = v.toInt());
               _saveConfig();
+            },
+          ),
+          const Divider(height: 32),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.file_download, size: 16),
+            label: const Text("导出当前所有配置备份"),
+            onPressed: () async {
+              final savePath = await FilePicker.platform.saveFile(
+                dialogTitle: '导出配置',
+                fileName: 'tts_config_backup.json',
+                type: FileType.custom,
+                allowedExtensions: ['json'],
+              );
+              if (savePath != null) {
+                _saveConfig();
+                await File(_localConfigFile.path).copy(savePath);
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("已备份至: $savePath")));
+              }
             },
           ),
         ],
@@ -1330,64 +1087,85 @@ class _ReaderHomePageState extends State<ReaderHomePage> {
     );
   }
 
-  Widget _buildLiveLogConsole() {
-    return Expanded(
-      child: Container(
-        color: const Color(0xFF1E1E1E),
-        child: Column(
-          children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              color: Colors.black54,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+  Widget _buildLiveLogTab() {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          color: Colors.grey.shade100,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text("输出监控", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              Row(
                 children: [
-                  const Text("实时调试日志", style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold)),
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.save_as, size: 16, color: Colors.white70),
-                        tooltip: "保存调试日志到文件",
-                        onPressed: () async {
-                          final path = await LogManager.instance.exportLogsToFile();
-                          if (path != null && mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("日志已保存至: $path")));
-                          }
-                        },
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.clear_all, size: 16, color: Colors.white70),
-                        tooltip: "清空日志",
-                        onPressed: () => LogManager.instance.clear(),
-                      ),
-                    ],
+                  IconButton(
+                    icon: const Icon(Icons.save_as, size: 16),
+                    tooltip: "保存日志文件",
+                    onPressed: () async {
+                      final path = await LogManager.instance.exportLogsToFile();
+                      if (path != null && mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("日志已存至: $path")));
+                    },
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.clear_all, size: 16),
+                    tooltip: "清空",
+                    onPressed: () => LogManager.instance.clear(),
                   ),
                 ],
-              ),
-            ),
-            Expanded(
-              child: StreamBuilder<List<String>>(
-                stream: LogManager.instance.stream,
-                builder: (context, snapshot) {
-                  final logs = snapshot.data ?? [];
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (_logScrollController.hasClients) {
-                      _logScrollController.jumpTo(_logScrollController.position.maxScrollExtent);
-                    }
-                  });
-                  return ListView.builder(
-                    controller: _logScrollController,
-                    itemCount: logs.length,
-                    itemBuilder: (ctx, idx) => Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      child: Text(logs[idx], style: const TextStyle(color: Colors.lightGreenAccent, fontFamily: "Consolas", fontSize: 11)),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
+              )
+            ],
+          ),
         ),
+        Expanded(
+          child: Container(
+            color: const Color(0xFF1E1E1E),
+            child: StreamBuilder<List<String>>(
+              stream: LogManager.instance.stream,
+              builder: (context, snapshot) {
+                final logs = snapshot.data ?? [];
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (_logScrollController.hasClients) {
+                    _logScrollController.jumpTo(_logScrollController.position.maxScrollExtent);
+                  }
+                });
+                return ListView.builder(
+                  controller: _logScrollController,
+                  itemCount: logs.length,
+                  itemBuilder: (ctx, idx) => Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    child: Text(logs[idx], style: const TextStyle(color: Colors.lightGreenAccent, fontFamily: "Consolas", fontSize: 11)),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildNetworkStatusTab() {
+    final currentProxy = AppProxyManager.instance.getProxyString(Uri());
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text("当前全局网络模式", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: const Color(0xFFEDE7F6), borderRadius: BorderRadius.circular(8)),
+            child: Text("路由策略: ${AppProxyManager.instance.mode}\n当前通道: $currentProxy", style: const TextStyle(color: Color(0xFF5E35B1), fontWeight: FontWeight.bold, fontSize: 12)),
+          ),
+          const SizedBox(height: 16),
+          FilledButton.tonalIcon(
+            icon: const Icon(Icons.settings_ethernet, size: 16),
+            label: const Text("修改代理模式与端口"),
+            onPressed: _openProxySettingsDialog,
+          ),
+        ],
       ),
     );
   }
