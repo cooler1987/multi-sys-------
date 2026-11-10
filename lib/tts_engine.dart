@@ -412,7 +412,7 @@ class DefaultEnginePresets {
         id: "cf_worker_template",
         name: "Cloudflare 中转引擎 (国内直连)",
         method: "GET",
-        urlTemplate: "https://tts.yzwww.ggff.net/tts?token=你的访问密码&text={{text}}&voice={{voice}}&speed={{speed}}&bitrate={{bitrate}}",
+        urlTemplate: "https://xxx.xxx.CF地址xxx.xxx/tts?token=你的访问密码&text={{text}}&voice={{voice}}&speed={{speed}}&bitrate={{bitrate}}",
         headers: {},
         bodyTemplate: "",
         responseType: AudioResponseType.binaryStream,
